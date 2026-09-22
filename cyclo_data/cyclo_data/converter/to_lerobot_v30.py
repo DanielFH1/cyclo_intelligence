@@ -323,6 +323,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         self._current_data_file_frames = 0
         self._episode_metadata_by_index: Dict[int, EpisodeMetadata] = {}
         self._current_data_aggregate_cache_key: Optional[Dict[str, Any]] = None
+        self._written_data_files: List[Path] = []
 
         # Per-camera video tracking
         self._video_tracking: Dict[str, Dict[str, Any]] = {}
@@ -723,6 +724,13 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                     'selected_state_topics': list(self.config.selected_state_topics),
                     'selected_action_topics': list(self.config.selected_action_topics),
                     'selected_joints': list(self.config.selected_joints),
+                    'tactile_mode': self.config.tactile_mode,
+                    'selected_tactile_topics': list(
+                        self.config.selected_tactile_topics
+                    ),
+                    'tactile_baseline_samples': int(
+                        self.config.tactile_baseline_samples
+                    ),
                     'source_rosbags': list(self.config.source_rosbags),
                 }
                 max_workers = _resolve_conversion_worker_count(len(missing_bag_paths))
@@ -808,6 +816,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         self._current_data_file_size_mb = 0.0
         self._current_data_file_frames = 0
         self._current_data_aggregate_cache_key = None
+        self._written_data_files = []
         self._video_tracking = {}
         self._pending_parquet_data = []
         self._pending_video_files = {}
@@ -901,6 +910,16 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 episode.observation_state
             ),
             "action": self._array_cache_signature(episode.action),
+            "tactile": {
+                side: self._array_cache_signature(values)
+                for side, values in sorted(episode.tactile.items())
+            },
+            "tactile_baseline": {
+                side: self._array_cache_signature(values)
+                for side, values in sorted(
+                    episode.tactile_baseline.items()
+                )
+            },
             "subtask_indices": self._array_cache_signature(episode.subtask_indices),
             "video_files": video_files,
         }
@@ -1042,6 +1061,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         if not isinstance(data_files, list):
             return False
         try:
+            restored_data_files: List[Path] = []
             for rel_path in data_files:
                 if not isinstance(rel_path, str):
                     return False
@@ -1050,8 +1070,10 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 if not src.exists() or src.stat().st_size <= 0:
                     return False
                 self._clone_or_copy_no_hardlink(src, dst)
+                restored_data_files.append(dst)
             if not self._restore_data_aggregate_metadata(manifest):
                 return False
+            self._written_data_files = restored_data_files
             self._log_info(
                 f"Reused v3 data aggregate cache: {len(data_files)} file(s)"
             )
@@ -1420,6 +1442,7 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         self._episode_metadata_by_index = {
             int(ep.episode_index): ep for ep in self._episode_metadata_list
         }
+        self._written_data_files = list(written_data_files)
         self._store_data_aggregate_cache(
             output_dir,
             episodes_data,
@@ -1460,6 +1483,24 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         )
         state_dim = len(first_state) if first_state is not None else 0
         action_dim = len(first_action) if first_action is not None else 0
+        tactile_sides = sorted(
+            {
+                side
+                for episode in episodes
+                for side, values in episode.tactile.items()
+                if values
+            }
+        )
+        tactile_dims = {
+            side: int(
+                next(
+                    np.asarray(episode.tactile[side][0]).size
+                    for episode in episodes
+                    if episode.tactile.get(side)
+                )
+            )
+            for side in tactile_sides
+        }
 
         schema_fields = [
             pa.field("timestamp", pa.float32()),
@@ -1476,6 +1517,20 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             )
         if action_dim > 0:
             schema_fields.append(pa.field("action", pa.list_(pa.float32(), action_dim)))
+        for side in tactile_sides:
+            width = tactile_dims[side]
+            schema_fields.extend(
+                [
+                    pa.field(
+                        f"observation.tactile.{side}",
+                        pa.list_(pa.float32(), width),
+                    ),
+                    pa.field(
+                        f"observation.tactile_baseline.{side}",
+                        pa.list_(pa.float32(), width),
+                    ),
+                ]
+            )
 
         timestamps = np.empty(num_frames, dtype=np.float32)
         frame_index = np.empty(num_frames, dtype=np.int64)
@@ -1492,6 +1547,14 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             np.empty((num_frames, action_dim), dtype=np.float32)
             if action_dim > 0 else None
         )
+        tactile_values = {
+            side: np.empty((num_frames, tactile_dims[side]), dtype=np.float32)
+            for side in tactile_sides
+        }
+        tactile_baseline_values = {
+            side: np.empty((num_frames, tactile_dims[side]), dtype=np.float32)
+            for side in tactile_sides
+        }
 
         offset = 0
         for episode in episodes:
@@ -1523,6 +1586,20 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                     episode.action[:length],
                     dtype=np.float32,
                 )
+            for side in tactile_sides:
+                raw = episode.tactile.get(side)
+                baseline = episode.tactile_baseline.get(side)
+                if len(raw or []) != length or len(baseline or []) != length:
+                    raise ValueError(
+                        f"Episode {episode.episode_index} has incomplete "
+                        f"tactile rows for side={side}"
+                    )
+                tactile_values[side][offset:end] = np.asarray(
+                    raw, dtype=np.float32
+                ).reshape(length, tactile_dims[side])
+                tactile_baseline_values[side][offset:end] = np.asarray(
+                    baseline, dtype=np.float32
+                ).reshape(length, tactile_dims[side])
             offset = end
 
         arrays = [
@@ -1547,11 +1624,27 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         if action_values is not None:
             action_flat = pa.array(action_values.reshape(-1), type=pa.float32())
             arrays.append(pa.FixedSizeListArray.from_arrays(action_flat, action_dim))
+        for side in tactile_sides:
+            width = tactile_dims[side]
+            raw_flat = pa.array(
+                tactile_values[side].reshape(-1), type=pa.float32()
+            )
+            baseline_flat = pa.array(
+                tactile_baseline_values[side].reshape(-1),
+                type=pa.float32(),
+            )
+            arrays.extend(
+                [
+                    pa.FixedSizeListArray.from_arrays(raw_flat, width),
+                    pa.FixedSizeListArray.from_arrays(baseline_flat, width),
+                ]
+            )
 
         hf_metadata = self._data_file_hf_metadata(
             has_subtask_feature,
             state_dim,
             action_dim,
+            tactile_dims,
         )
         schema = pa.schema(schema_fields).with_metadata(
             {"huggingface": hf_metadata}
@@ -1569,7 +1662,9 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         has_subtask_feature: bool,
         state_dim: int,
         action_dim: int,
+        tactile_dims: Optional[Dict[str, int]] = None,
     ) -> str:
+        tactile_dims = tactile_dims or {}
         hf_features = {
             "timestamp": {"dtype": "float32", "_type": "Value"},
             "frame_index": {"dtype": "int64", "_type": "Value"},
@@ -1591,6 +1686,16 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 "length": action_dim,
                 "_type": "Sequence",
             }
+        for side, width in sorted(tactile_dims.items()):
+            for prefix in (
+                "observation.tactile",
+                "observation.tactile_baseline",
+            ):
+                hf_features[f"{prefix}.{side}"] = {
+                    "feature": {"dtype": "float32", "_type": "Value"},
+                    "length": width,
+                    "_type": "Sequence",
+                }
         return json.dumps({"info": {"features": hf_features}})
 
     def _flush_data_file(self, output_dir: Path, frames: List[Dict[str, Any]]):
@@ -1610,6 +1715,16 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
         first_action = frames[0].get("action")
         state_dim = len(first_state) if first_state is not None else 0
         action_dim = len(first_action) if first_action is not None else 0
+        tactile_keys = sorted(
+            key
+            for key in frames[0]
+            if key.startswith("observation.tactile.")
+            or key.startswith("observation.tactile_baseline.")
+        )
+        tactile_dims = {
+            key: int(np.asarray(frames[0][key]).size)
+            for key in tactile_keys
+        }
 
         schema_fields = [
             pa.field("timestamp", pa.float32()),
@@ -1628,6 +1743,10 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             )
         if action_dim > 0:
             schema_fields.append(pa.field("action", pa.list_(pa.float32(), action_dim)))
+        for key in tactile_keys:
+            schema_fields.append(
+                pa.field(key, pa.list_(pa.float32(), tactile_dims[key]))
+            )
 
         schema = pa.schema(schema_fields)
 
@@ -1711,6 +1830,13 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             arrays.append(
                 pa.FixedSizeListArray.from_arrays(action_flat, action_dim)
             )
+        for key in tactile_keys:
+            width = tactile_dims[key]
+            values = np.asarray(
+                [frame[key] for frame in frames], dtype=np.float32
+            ).reshape(num_frames, width)
+            flat = pa.array(values.reshape(-1), type=pa.float32())
+            arrays.append(pa.FixedSizeListArray.from_arrays(flat, width))
 
         hf_features = {
             "timestamp": {"dtype": "float32", "_type": "Value"},
@@ -1732,6 +1858,12 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             hf_features["action"] = {
                 "feature": {"dtype": "float32", "_type": "Value"},
                 "length": action_dim,
+                "_type": "Sequence",
+            }
+        for key in tactile_keys:
+            hf_features[key] = {
+                "feature": {"dtype": "float32", "_type": "Value"},
+                "length": tactile_dims[key],
                 "_type": "Sequence",
             }
 
@@ -4150,6 +4282,142 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
             )
         self._log_info(f"Wrote subtasks metadata: {path}")
 
+    def _data_files_for_global_stats(self) -> List[Path]:
+        """Return only Parquet files belonging to this conversion run."""
+        tracked = [
+            Path(path)
+            for path in self._written_data_files
+            if Path(path).exists()
+        ]
+        if tracked:
+            return sorted(tracked)
+        output_dir = Path(self.config.output_dir)
+        return sorted((output_dir / "data").glob("chunk-*/file-*.parquet"))
+
+    @staticmethod
+    def _parquet_column_matrix(column: Any, width: int) -> np.ndarray:
+        """Convert one Arrow batch column to a bounded 2-D float64 array."""
+        if column.null_count:
+            raise ValueError("Cannot compute quantiles from null values")
+        if pa.types.is_fixed_size_list(column.type):
+            flat = column.flatten().to_numpy(zero_copy_only=False)
+            values = np.asarray(flat, dtype=np.float64)
+        elif pa.types.is_floating(column.type) or pa.types.is_integer(
+            column.type
+        ):
+            values = np.asarray(
+                column.to_numpy(zero_copy_only=False),
+                dtype=np.float64,
+            )
+        else:
+            values = np.asarray(column.to_pylist(), dtype=np.float64)
+        try:
+            return values.reshape(len(column), width)
+        except ValueError as exc:
+            raise ValueError(
+                f"Parquet column width mismatch: expected {width}, "
+                f"got shape {values.shape}"
+            ) from exc
+
+    def _compute_exact_parquet_quantiles(
+        self,
+        feature_keys: List[str],
+    ) -> Dict[str, Dict[str, List[float]]]:
+        """Compute exact full-dataset q01/q99 from written data columns.
+
+        A disk-backed array is populated one feature at a time and quantiles
+        are selected one dimension at a time. This avoids retaining every
+        feature for the whole dataset in RAM while still using the actual
+        train rows (rather than mathematically invalid averages of episode
+        quantiles).
+        """
+        data_files = self._data_files_for_global_stats()
+        if not data_files or not feature_keys:
+            return {}
+
+        parquet_files = [pq.ParquetFile(path) for path in data_files]
+        total_rows = sum(item.metadata.num_rows for item in parquet_files)
+        if total_rows <= 0:
+            return {}
+
+        output_dir = Path(self.config.output_dir)
+        temp_parent = output_dir / "meta"
+        temp_parent.mkdir(parents=True, exist_ok=True)
+        result: Dict[str, Dict[str, List[float]]] = {}
+
+        with tempfile.TemporaryDirectory(
+            prefix=".quantiles-",
+            dir=temp_parent,
+        ) as temp_dir:
+            for feature_key in feature_keys:
+                feature = self._features[feature_key]
+                width = int(np.prod(feature.get("shape") or (1,)))
+                if width <= 0:
+                    continue
+                for parquet_file, path in zip(parquet_files, data_files):
+                    if feature_key not in parquet_file.schema_arrow.names:
+                        raise ValueError(
+                            f"Training data file {path} is missing "
+                            f"quantile feature {feature_key!r}"
+                        )
+
+                safe_name = hashlib.sha256(
+                    feature_key.encode("utf-8")
+                ).hexdigest()[:16]
+                mmap_path = Path(temp_dir) / f"{safe_name}.float64"
+                values = np.memmap(
+                    mmap_path,
+                    mode="w+",
+                    dtype=np.float64,
+                    shape=(total_rows, width),
+                )
+                offset = 0
+                try:
+                    for parquet_file in parquet_files:
+                        for batch in parquet_file.iter_batches(
+                            batch_size=16_384,
+                            columns=[feature_key],
+                        ):
+                            matrix = self._parquet_column_matrix(
+                                batch.column(0),
+                                width,
+                            )
+                            end = offset + len(matrix)
+                            values[offset:end] = matrix
+                            offset = end
+                    if offset != total_rows:
+                        raise ValueError(
+                            f"Read {offset} row(s) for {feature_key!r}, "
+                            f"expected {total_rows}"
+                        )
+                    values.flush()
+
+                    q01 = np.empty(width, dtype=np.float64)
+                    q99 = np.empty(width, dtype=np.float64)
+                    for dimension in range(width):
+                        dimension_values = values[:, dimension]
+                        try:
+                            quantiles = np.quantile(
+                                dimension_values,
+                                [0.01, 0.99],
+                                method="linear",
+                            )
+                        except TypeError:
+                            quantiles = np.quantile(
+                                dimension_values,
+                                [0.01, 0.99],
+                                interpolation="linear",
+                            )
+                        q01[dimension], q99[dimension] = quantiles
+                    result[feature_key] = {
+                        "q01": q01.tolist(),
+                        "q99": q99.tolist(),
+                    }
+                finally:
+                    del values
+
+        return result
+
     def _write_global_stats(self):
         """Write global statistics to stats.json.
 
@@ -4221,6 +4489,19 @@ class RosbagToLerobotV30Converter(RosbagToLerobotConverterBase):
                 "min": np.min(min_arrays, axis=0).tolist(),
                 "max": np.max(max_arrays, axis=0).tolist(),
             }
+
+        quantile_feature_keys = [
+            feature_key
+            for feature_key in aggregated_stats
+            if feature_key in self._features
+            and self._features[feature_key].get("dtype") != "video"
+            and self._features[feature_key].get("shape")
+        ]
+        exact_quantiles = self._compute_exact_parquet_quantiles(
+            quantile_feature_keys
+        )
+        for feature_key, quantiles in exact_quantiles.items():
+            aggregated_stats[feature_key].update(quantiles)
 
         stats_path = output_dir / "meta" / "stats.json"
         with open(stats_path, "w", encoding="utf-8") as f:

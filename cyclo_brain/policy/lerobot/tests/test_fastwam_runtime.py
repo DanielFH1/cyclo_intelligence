@@ -107,6 +107,18 @@ class FastWamLoadingTest(unittest.TestCase):
     def write_config(self, directory: str, policy_type: str):
         Path(directory, "config.json").write_text(json.dumps({"type": policy_type}))
 
+    def test_training_root_prefers_nested_pretrained_model_config(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            (root_path / "train_config.json").write_text("{}")
+            nested = root_path / "pretrained_model"
+            nested.mkdir()
+            self.write_config(str(nested), "act")
+
+            resolved = loading.LoadingMixin._resolve_model_dir(str(root_path))
+
+        self.assertEqual(resolved, str(nested))
+
     def test_fastwam_is_initially_loaded_on_cpu_without_full_gpu_move(self):
         with tempfile.TemporaryDirectory() as model_path:
             self.write_config(model_path, "fastwam")

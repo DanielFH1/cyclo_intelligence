@@ -37,7 +37,22 @@ class ActionChunkProcessor:
         postprocess: bool = True,
         target_chunk_size: Optional[int] = None,
         alignment_mode: str = "l2",
+        source_chunk_limit: Optional[int] = None,
+        sequential: bool = False,
     ):
+        # B briefly inserted source_chunk_limit before alignment_mode. Keep the
+        # A positional order while accepting that transient positional shape.
+        if (
+            isinstance(alignment_mode, (int, float))
+            and (
+                source_chunk_limit is None
+                or isinstance(source_chunk_limit, str)
+            )
+        ):
+            alignment_mode, source_chunk_limit = (
+                source_chunk_limit or "l2",
+                int(alignment_mode),
+            )
         self._inference_hz = float(inference_hz)
         self._control_hz = float(control_hz)
         if self._inference_hz <= 0.0:
@@ -48,9 +63,13 @@ class ActionChunkProcessor:
         self._blend_steps = max(1, int(self.BLEND_DURATION_S * self._control_hz))
         self._postprocess = bool(postprocess)
         self._target_chunk_size = target_chunk_size
+        self._source_chunk_limit = source_chunk_limit
         self._alignment_mode = str(alignment_mode).lower()
+        self._sequential = bool(sequential)
         if self._target_chunk_size is not None and self._target_chunk_size <= 0:
             raise ValueError("target_chunk_size must be positive")
+        if self._source_chunk_limit is not None and self._source_chunk_limit <= 0:
+            raise ValueError("source_chunk_limit must be positive")
         if self._alignment_mode not in {"l2", "none", "rtc"}:
             raise ValueError("alignment_mode must be one of: 'l2', 'none', 'rtc'")
 
@@ -58,6 +77,12 @@ class ActionChunkProcessor:
         self._last_action: Optional[np.ndarray] = None
         self._last_output_action: Optional[np.ndarray] = None
         self._lock = threading.Lock()
+        self._last_push_info = {}
+
+    @property
+    def last_push_info(self) -> dict:
+        with self._lock:
+            return dict(self._last_push_info)
 
     @property
     def buffer_size(self) -> int:
@@ -84,23 +109,58 @@ class ActionChunkProcessor:
 
         with self._lock:
             anchor = self._alignment_anchor()
-            if not self._postprocess:
-                for action in chunk:
-                    self._buffer.append(np.asarray(action).copy())
-                if len(chunk) > 0:
-                    self._last_action = np.asarray(chunk[-1]).copy()
-                return len(chunk)
-
             aligned = (
                 self._align(chunk, anchor, scheduled_start_delay_s)
-                if align
+                if align and not self._sequential
                 else chunk
             )
+            self._last_push_info = {
+                'prepared_rows': len(chunk),
+                'aligned_start_row': len(chunk) - len(aligned),
+                'selected_rows': min(len(aligned), self._source_chunk_limit or len(aligned)),
+                'scheduled_start_delay_s': scheduled_start_delay_s,
+            }
             if len(aligned) == 0:
                 return 0
+            if self._source_chunk_limit is not None:
+                aligned = aligned[: int(self._source_chunk_limit)]
 
-            interpolated = self._interpolate(aligned)
-            blended = self._blend(interpolated, anchor)
+            # Latency alignment and the bounded execution horizon are part of
+            # the policy contract, not interpolation.  Keep them active when
+            # deployments explicitly disable 100 Hz post-processing too.
+            if not self._postprocess:
+                for action in aligned:
+                    self._buffer.append(np.asarray(action).copy())
+                self._last_action = np.asarray(aligned[-1]).copy()
+                return len(aligned)
+
+            timed = aligned
+            if self._sequential:
+                # A discrete source action occupies one full inference tick.
+                # Interpolation normally spans only the intervals between
+                # samples, so append the final endpoint once to retain the
+                # last ACT action for its 1 / inference_hz period.  Four ACT
+                # actions at 30 Hz therefore occupy 4/30 s, not 3/30 s.
+                timed = np.concatenate((aligned, aligned[-1:]), axis=0)
+
+            interpolated = self._interpolate(timed)
+            # Ordered ACT chunks are consecutive policy actions, not
+            # independently aligned trajectory proposals.  A long decoder
+            # horizon can use the original 0.2 s transition blend and still
+            # spend most of its duration on the raw model trajectory.  For a
+            # short horizon that blend would damp every row, so join only over
+            # one source period instead.
+            if self._sequential:
+                source_duration_s = len(aligned) / self._inference_hz
+                if source_duration_s >= self.BLEND_DURATION_S:
+                    blended = self._blend(interpolated, anchor)
+                else:
+                    blended = self._blend_sequential_boundary(
+                        interpolated,
+                        anchor,
+                    )
+            else:
+                blended = self._blend(interpolated, anchor)
 
             for action in blended:
                 self._buffer.append(action)
@@ -124,6 +184,28 @@ class ActionChunkProcessor:
                 self._last_output_action = np.asarray(action).copy()
                 return action
             return None
+
+    def defer_action(
+        self,
+        action: np.ndarray,
+        *,
+        published_action: Optional[np.ndarray] = None,
+    ) -> None:
+        """Put an unachieved target back at the front of the output buffer.
+
+        Real-robot tracking safety can replace a desired action with a bounded
+        bridge step while the follower catches up.  The desired action must not
+        be discarded in that case.  ``published_action`` also repairs the
+        alignment anchor that :meth:`pop_action` optimistically advanced to the
+        desired value before the safety bridge was applied.
+        """
+        desired = np.asarray(action).copy()
+        with self._lock:
+            self._buffer.appendleft(desired)
+            if published_action is not None:
+                self._last_output_action = np.asarray(
+                    published_action
+                ).copy()
 
     def clear(self) -> None:
         with self._lock:
@@ -158,8 +240,21 @@ class ActionChunkProcessor:
         anchor: Optional[np.ndarray],
         scheduled_start_delay_s: Optional[float],
     ) -> np.ndarray:
-        if anchor is None or len(chunk) <= 1:
+        if len(chunk) <= 1:
             return chunk
+        if anchor is None:
+            if scheduled_start_delay_s is None:
+                return chunk
+            expected_idx = min(
+                len(chunk) - 1,
+                int(
+                    round(
+                        max(0.0, scheduled_start_delay_s)
+                        * self._inference_hz
+                    )
+                ),
+            )
+            return chunk[expected_idx:]
         window_n = int(round(self._chunk_align_window_s * self._inference_hz))
         window_n = max(1, window_n)
         if scheduled_start_delay_s is None:
@@ -229,6 +324,28 @@ class ActionChunkProcessor:
             alpha = (i + 1) / (n_blend + 1)
             chunk[i] = (1 - alpha) * anchor + alpha * chunk[i]
         return chunk
+
+    def _blend_sequential_boundary(
+        self,
+        chunk: np.ndarray,
+        anchor: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Join one ordered chunk boundary without damping its full horizon."""
+        if anchor is None or len(chunk) == 0:
+            return chunk
+        out = chunk.copy()
+        boundary_steps = max(
+            1,
+            int(round(self._control_hz / self._inference_hz)),
+        )
+        boundary_steps = min(boundary_steps, len(out))
+        for i in range(boundary_steps):
+            # Reach the unmodified source trajectory on the final boundary
+            # step.  The generic blend deliberately uses n+1 and therefore
+            # never reaches it inside the blend window.
+            alpha = (i + 1) / boundary_steps
+            out[i] = (1.0 - alpha) * anchor + alpha * out[i]
+        return out
 
 
 def build_action_joint_map(

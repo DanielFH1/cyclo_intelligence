@@ -65,6 +65,11 @@ bool publish_to_robot
 string action_request_mode
 string acceleration_mode
 string acceleration_engine_path
+uint16 control_hz
+uint16 inference_hz
+float64 chunk_align_window_s
+bool initial_pose_sync
+float64 initial_pose_sync_duration_s
 """
 
 INFERENCE_COMMAND_RESPONSE_DEF = """\
@@ -128,6 +133,19 @@ string message
 # ============================================================
 # Message Definitions (msg)
 # ============================================================
+
+# --- InferenceStatus (interfaces/msg/InferenceStatus.msg) ---
+INFERENCE_STATUS_DEF = """\
+uint8 READY = 0
+uint8 LOADING = 1
+uint8 INFERENCING = 2
+uint8 PAUSED = 3
+uint8 SYNCING = 4
+
+string robot_type
+uint8 inference_phase
+string error
+"""
 
 # --- TrainingProgress (interfaces/msg/TrainingProgress.msg) ---
 TRAINING_PROGRESS_DEF = """\

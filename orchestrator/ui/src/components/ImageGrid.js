@@ -149,6 +149,7 @@ export default function ImageGrid({ isActive = true }) {
       saved &&
       savedTopicsMatchAvailableTopics(saved, imageTopics)
     ) {
+      setAsignedImageTopicList(saved);
       return;
     }
     console.log(`Applied camera topics for ${robotType || 'current robot'}:`, nextAssignment);

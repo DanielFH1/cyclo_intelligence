@@ -42,6 +42,7 @@ const renderPanel = ({
   inferencePhase = InferencePhase.READY,
   taskOverrides = {},
   sendRecordCommand: sendOverride = null,
+  switchState = {},
 } = {}) => {
   const sendRecordCommand = sendOverride || jest.fn().mockResolvedValue({
     success: true,
@@ -62,6 +63,7 @@ const renderPanel = ({
     preloadedState: {
       tasks: {
         ...initialTasks,
+        inferenceModelSwitch: { ...initialTasks.inferenceModelSwitch, ...switchState },
         sharedTaskInfo: {
           ...initialTasks.sharedTaskInfo,
           taskInstruction: sharedTaskInstruction,
@@ -104,6 +106,45 @@ describe('InferenceControlPanel deploy safety', () => {
     jest.clearAllMocks();
   });
 
+  test('keeps Stop available and blocks Start, Clear and Cycle Home during switching', () => {
+    renderPanel({ inferencePhase: InferencePhase.LOADING, switchState: { busy: true } });
+    expect(screen.getByRole('button', { name: /pause inference/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^start inference$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /stop inference and unload/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /return to the task start pose/i })).toBeDisabled();
+  });
+
+  test('paused model resumes after mounting the panel without a local start history', async () => {
+    const { sendRecordCommand } = renderPanel({ inferencePhase: InferencePhase.PAUSED, inferenceMode: 'simulation' });
+    fireEvent.click(screen.getByRole('button', { name: /resume inference/i }));
+    await waitFor(() => expect(sendRecordCommand).toHaveBeenCalledWith('resume_inference', { inferenceMode: 'simulation' }));
+  });
+
+  test('shows fresh-cycle acknowledgement instead of a generic Resume success', async () => {
+    const message = 'Fresh inference cycle started after Cycle Home';
+    renderPanel({
+      inferencePhase: InferencePhase.PAUSED,
+      inferenceMode: 'simulation',
+      sendRecordCommand: jest.fn().mockResolvedValue({ success: true, message }),
+    });
+    fireEvent.click(screen.getByRole('button', { name: /resume inference/i }));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith(message));
+    expect(toast.success).not.toHaveBeenCalledWith('Resume executed successfully');
+  });
+
+  test.each([InferencePhase.READY, InferencePhase.PAUSED])('preloading blocks starting and unloading in phase %s', (inferencePhase) => {
+    renderPanel({ inferencePhase, switchState: { preloadBusy: true } });
+    expect(screen.getByRole('button', { name: /^(start|resume) inference$/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /stop inference and unload/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /return to the task start pose/i })).toBeDisabled();
+  });
+
+  test('unknown switch outcome blocks resume and still permits Stop while loading', () => {
+    renderPanel({ inferencePhase: InferencePhase.LOADING, switchState: { needsClear: true } });
+    expect(screen.getByRole('button', { name: /pause inference/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /^start inference$/i })).toBeDisabled();
+  });
+
   test('shows a warning instead of starting immediately for Real Robot Deploy', async () => {
     const { sendRecordCommand } = renderPanel({ inferenceMode: 'robot' });
 
@@ -125,6 +166,190 @@ describe('InferenceControlPanel deploy safety', () => {
         inferenceMode: 'robot',
       });
     });
+  });
+
+  test('shows the configured initial pose sync duration in the robot warning', async () => {
+    renderPanel({
+      inferenceMode: 'robot',
+      taskOverrides: {
+        initialPoseSync: true,
+        initialPoseSyncDurationS: 7.5,
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start inference/i }));
+
+    expect(await screen.findByText('Initial Pose Sync: 7.5 s')).toBeInTheDocument();
+  });
+
+  test('shows unusual Dataset FPS in the robot confirmation without blocking deploy', async () => {
+    const { sendRecordCommand } = renderPanel({
+      inferenceMode: 'robot',
+      taskOverrides: { inferenceHz: 1515, controlHz: 200 },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start inference/i }));
+
+    expect(await screen.findByText(
+      'Dataset FPS is unusually high (1515). Confirm it matches the training dataset.'
+    )).toBeInTheDocument();
+    expect(screen.getByText(
+      'Dataset FPS is higher than Control Hz, so action waypoints will be downsampled.'
+    )).toBeInTheDocument();
+    expect(sendRecordCommand).not.toHaveBeenCalled();
+  });
+
+  test('does not start while Dataset FPS is blank', async () => {
+    const { sendRecordCommand } = renderPanel({
+      inferenceMode: 'robot',
+      taskOverrides: { inferenceHz: '' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start inference/i }));
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith('Missing required fields: Dataset FPS');
+    });
+    expect(screen.queryByRole('dialog', { name: /real robot deploy/i }))
+      .not.toBeInTheDocument();
+    expect(sendRecordCommand).not.toHaveBeenCalled();
+  });
+
+  test('resumes a regular robot session without another deploy warning', async () => {
+    const { store, sendRecordCommand } = renderPanel({
+      inferenceMode: 'robot',
+      taskOverrides: {
+        initialPoseSync: true,
+        initialPoseSyncDurationS: 10.0,
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start inference/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Real Robot Deploy$/i }));
+    await waitFor(() => {
+      expect(sendRecordCommand).toHaveBeenCalledWith('start_inference', {
+        inferenceMode: 'robot',
+      });
+    });
+
+    act(() => {
+      store.dispatch(setInferenceStatus({ inferencePhase: InferencePhase.INFERENCING }));
+    });
+    act(() => {
+      store.dispatch(setInferenceStatus({ inferencePhase: InferencePhase.PAUSED }));
+    });
+    sendRecordCommand.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: /resume inference/i }));
+
+    await waitFor(() => {
+      expect(sendRecordCommand).toHaveBeenCalledWith('resume_inference', {
+        inferenceMode: 'robot',
+      });
+    });
+    expect(screen.queryByRole('dialog', { name: /real robot deploy/i }))
+      .not.toBeInTheDocument();
+  });
+
+  test('resumes an interrupted sync without another deploy warning', async () => {
+    const { store, sendRecordCommand } = renderPanel({
+      inferenceMode: 'robot',
+      taskOverrides: {
+        initialPoseSync: true,
+        initialPoseSyncDurationS: 10.0,
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start inference/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Real Robot Deploy$/i }));
+    await waitFor(() => {
+      expect(sendRecordCommand).toHaveBeenCalledWith('start_inference', {
+        inferenceMode: 'robot',
+      });
+    });
+
+    act(() => {
+      store.dispatch(setInferenceStatus({ inferencePhase: InferencePhase.SYNCING }));
+    });
+    act(() => {
+      store.dispatch(setInferenceStatus({ inferencePhase: InferencePhase.PAUSED }));
+    });
+    sendRecordCommand.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: /resume inference/i }));
+
+    await waitFor(() => {
+      expect(sendRecordCommand).toHaveBeenCalledWith('resume_inference', {
+        inferenceMode: 'robot',
+      });
+    });
+    expect(screen.queryByRole('dialog', { name: /real robot deploy/i }))
+      .not.toBeInTheDocument();
+  });
+
+  test('rejects an invalid initial pose sync duration before robot confirmation', async () => {
+    const { sendRecordCommand } = renderPanel({
+      inferenceMode: 'robot',
+      taskOverrides: {
+        initialPoseSync: true,
+        initialPoseSyncDurationS: 0.5,
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start inference/i }));
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(
+        'Initial Pose Sync duration must be between 1 and 60 seconds'
+      );
+    });
+    expect(screen.queryByRole('dialog', { name: /real robot deploy/i }))
+      .not.toBeInTheDocument();
+    expect(sendRecordCommand).not.toHaveBeenCalled();
+  });
+
+  test('keeps Stop and Clear enabled while initial pose sync is active', () => {
+    renderPanel({
+      inferenceMode: 'robot',
+      inferencePhase: InferencePhase.SYNCING,
+    });
+
+    expect(screen.getByRole('button', { name: /start inference/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /pause inference/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /unload model/i })).toBeEnabled();
+    expect(screen.getByText('Synchronizing initial robot pose...')).toBeInTheDocument();
+  });
+
+  test.each([
+    ['Stop', /pause inference/i, 'stop_inference'],
+    ['Clear', /unload model/i, 'finish'],
+  ])('keeps SYNCING after a failed %s hold', async (
+    _label,
+    buttonName,
+    command,
+  ) => {
+    const sendRecordCommand = jest.fn().mockResolvedValue({
+      success: false,
+      message: 'current-pose hold failed; retry',
+    });
+    const { store } = renderPanel({
+      inferenceMode: 'robot',
+      inferencePhase: InferencePhase.SYNCING,
+      sendRecordCommand,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: buttonName }));
+
+    await waitFor(() => {
+      expect(sendRecordCommand).toHaveBeenCalledWith(command, {});
+      expect(toast.error).toHaveBeenCalledWith(
+        'Command failed: current-pose hold failed; retry'
+      );
+    });
+    expect(store.getState().tasks.inferenceStatus.inferencePhase)
+      .toBe(InferencePhase.SYNCING);
+    expect(screen.getByRole('button', { name: /pause inference/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /unload model/i })).toBeEnabled();
   });
 
   test('can switch the pending start to 3D Sim Deploy from the warning', async () => {
@@ -192,6 +417,70 @@ describe('InferenceControlPanel deploy safety', () => {
     await waitFor(() => {
       expect(sendRecordCommand).not.toHaveBeenCalled();
     });
+  });
+
+  test('Cycle Home pauses and requests task pose return for Real Tactile ACT', async () => {
+    const { sendRecordCommand } = renderPanel({
+      inferenceMode: 'robot',
+      inferencePhase: InferencePhase.INFERENCING,
+      taskOverrides: {
+        serviceType: 'lerobot',
+        policyType: 'tactile_act',
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', {
+      name: /return to the task start pose/i,
+    }));
+
+    await waitFor(() => {
+      expect(sendRecordCommand).toHaveBeenCalledWith('prepare_next_cycle', {});
+    });
+  });
+
+  test('Cycle Home is available for Real ViTacFormer inference', () => {
+    renderPanel({
+      inferenceMode: 'robot',
+      inferencePhase: InferencePhase.INFERENCING,
+      taskOverrides: {
+        serviceType: 'vitacformer',
+        policyType: 'vitacformer',
+      },
+    });
+
+    expect(screen.getByRole('button', {
+      name: /return to the task start pose/i,
+    })).toBeEnabled();
+  });
+
+  test('Cycle Home remains available after a Real safety gate pauses inference', () => {
+    renderPanel({
+      inferenceMode: 'robot',
+      inferencePhase: InferencePhase.PAUSED,
+      taskOverrides: {
+        serviceType: 'vitacformer',
+        policyType: 'vitacformer',
+      },
+    });
+
+    expect(screen.getByRole('button', {
+      name: /return to the task start pose/i,
+    })).toBeEnabled();
+  });
+
+  test('Cycle Home stays disabled outside Real Tactile ACT inference', () => {
+    renderPanel({
+      inferenceMode: 'simulation',
+      inferencePhase: InferencePhase.INFERENCING,
+      taskOverrides: {
+        serviceType: 'lerobot',
+        policyType: 'tactile_act',
+      },
+    });
+
+    expect(screen.getByRole('button', {
+      name: /return to the task start pose/i,
+    })).toBeDisabled();
   });
 
   test('requires shared task instruction for language-conditioned inference', async () => {

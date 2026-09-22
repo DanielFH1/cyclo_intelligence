@@ -45,8 +45,74 @@ describe('taskSlice task ownership', () => {
     const inferenceInfo = selectInferenceTaskInfo({ tasks: state });
 
     expect(inferenceInfo.inferenceMode).toBe('simulation');
-    expect(inferenceInfo.actionRequestMode).toBe('async');
+    expect(inferenceInfo.actionRequestMode).toBe('sync');
     expect(inferenceInfo.accelerationMode).toBe('pytorch');
+    expect(inferenceInfo.initialPoseSync).toBe(false);
+    expect(inferenceInfo.initialPoseSyncDurationS).toBe(5.0);
+    expect(inferenceInfo.serviceType).toBe('lerobot');
+    expect(inferenceInfo.policyType).toBe('act');
+    expect(inferenceInfo.inferenceHz).toBe(30);
+  });
+
+  test('does not let a legacy generic 15 Hz server echo replace the ACT default', () => {
+    const next = reducer(
+      undefined,
+      receiveServerRecordTaskInfo({
+        taskType: 'inference',
+        serviceType: 'lerobot',
+        inferenceHz: 15,
+      })
+    );
+
+    expect(selectInferenceTaskInfo({ tasks: next })).toMatchObject({
+      serviceType: 'lerobot',
+      policyType: 'act',
+      inferenceHz: 30,
+    });
+  });
+
+  test('keeps an explicit local ACT 15 Hz override when the server confirms it', () => {
+    const edited = reducer(
+      reducer(undefined, setInferenceTaskInfo({ inferenceHz: 15 })),
+      markLocalTaskInfoEdited({ source: 'inference' })
+    );
+    const next = reducer(
+      edited,
+      receiveServerRecordTaskInfo({
+        taskType: 'inference',
+        serviceType: 'lerobot',
+        inferenceHz: 15,
+      })
+    );
+
+    expect(selectInferenceTaskInfo({ tasks: next }).inferenceHz).toBe(15);
+    expect(next.inferenceTaskInfoSync.dirty).toBe(false);
+    expect(next.inferenceTaskInfoSync.syncStatus).toBe('synced');
+  });
+
+  test('keeps the generic 15 Hz server value for non-ACT policies', () => {
+    const grootState = reducer(
+      undefined,
+      setInferenceTaskInfo({
+        serviceType: 'groot',
+        policyType: 'n17',
+        inferenceHz: 15,
+      })
+    );
+    const next = reducer(
+      grootState,
+      receiveServerRecordTaskInfo({
+        taskType: 'inference',
+        serviceType: 'groot',
+        inferenceHz: 15,
+      })
+    );
+
+    expect(selectInferenceTaskInfo({ tasks: next })).toMatchObject({
+      serviceType: 'groot',
+      policyType: 'n17',
+      inferenceHz: 15,
+    });
   });
 
   test('sets inference mode without changing record identity', () => {
@@ -331,7 +397,7 @@ describe('taskSlice task ownership', () => {
     expect(next.inferenceTaskInfoSync.syncStatus).toBe('synced');
   });
 
-  test('matching inference echo accepts backend-normalized numeric defaults', () => {
+  test('backend defaults do not overwrite blank inference timing edits', () => {
     const edited = reducer(
       reducer(
         undefined,
@@ -360,11 +426,13 @@ describe('taskSlice task ownership', () => {
       })
     );
 
-    expect(selectInferenceTaskInfo({ tasks: next }).taskInstruction).toEqual([
-      'new prompt',
-    ]);
-    expect(next.inferenceTaskInfoSync.dirty).toBe(false);
-    expect(next.inferenceTaskInfoSync.syncStatus).toBe('synced');
+    expect(selectInferenceTaskInfo({ tasks: next })).toMatchObject({
+      taskInstruction: ['new prompt'],
+      controlHz: '',
+      inferenceHz: '',
+      chunkAlignWindowS: '',
+    });
+    expect(next.inferenceTaskInfoSync.dirty).toBe(true);
   });
 
   test('first stale record echo does not revert an inference-owned instruction edit', () => {

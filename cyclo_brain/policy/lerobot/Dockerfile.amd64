@@ -12,7 +12,7 @@
 #
 # Build context: cyclo_brain/policy/        (NOTE: parent of lerobot/)
 # Usage:         docker build -f lerobot/Dockerfile.amd64 \
-#                  -t robotis/lerobot-zenoh:1.4.0-amd64 .
+#                  -t robotis/lerobot-zenoh:1.4.1-amd64 .
 
 # NVIDIA PyTorch base image (Python 3.12 — required by upstream lerobot
 # pyproject.toml ``requires-python = ">=3.12"``).
@@ -21,6 +21,7 @@ FROM ${BASE_IMAGE}
 
 # GPU architecture build arg (default=use base image PyTorch, blackwell=install nightly cu128)
 ARG GPU_ARCH=default
+ARG LEROBOT_POLICY_FLAVOR=default
 
 # s6-overlay version (supervises the two processes)
 ARG S6_OVERLAY_VERSION=3.2.0.2
@@ -76,10 +77,27 @@ ENV PATH="/lerobot/.venv/bin:$PATH"
 COPY lerobot/lerobot/setup.py lerobot/lerobot/pyproject.toml lerobot/lerobot/README.md lerobot/lerobot/MANIFEST.in ./
 COPY lerobot/lerobot/src/ ./src/
 
-# Install training/inference + VLA extras. Removed: dynamixel/gamepad/
-# hopejr/lekiwi/reachy2/kinematics (hardware), dev/test/video_benchmark
-# (development), aloha/pusht/phone/libero/metaworld/sarm (simulation).
-RUN uv pip install --no-cache ".[dataset,smolvla,xvla,molmoact2,vla_jepa,fastwam,hilserl,async,peft]"
+# Install the normal multi-policy environment by default.  T-Rex is an
+# explicit, isolated flavor because its audited Qwen3-VL source requires
+# Transformers 4.57.3 while the regular LeRobot policies require 5.x.
+RUN case "${LEROBOT_POLICY_FLAVOR}" in \
+      default) uv pip install --no-cache ".[dataset,smolvla,xvla,molmoact2,vla_jepa,fastwam,hilserl,async,peft]" ;; \
+      trex) uv pip install --no-cache ".[training,async]" "timm==1.0.17" ;; \
+      *) echo "Unsupported LEROBOT_POLICY_FLAVOR=${LEROBOT_POLICY_FLAVOR}" >&2; exit 2 ;; \
+    esac
+
+# LeRobot core currently declares huggingface-hub>=1, while Transformers
+# 4.57.3 requires the pre-1.0 Hub API.  Resolve the normal environment first,
+# then replace only this audited trio without asking uv to re-resolve the
+# incompatible metadata.  This flavor is Phase-A only; PEFT/LoRA must use a
+# separately validated image.
+RUN if [ "${LEROBOT_POLICY_FLAVOR}" = "trex" ]; then \
+      uv pip install --no-cache --force-reinstall --no-deps \
+        "huggingface-hub==0.36.2" \
+        "tokenizers==0.22.2" \
+        "transformers==4.57.3"; \
+      python -c "import importlib.metadata as m; assert m.version('transformers') == '4.57.3'; assert m.version('tokenizers') == '0.22.2'; assert m.version('huggingface-hub') == '0.36.2'; from transformers import Qwen3VLForConditionalGeneration; from lerobot.policies.trex.configuration_trex import TRexConfig"; \
+    fi
 
 # Blackwell (sm_120) support: override PyTorch with nightly cu128 build
 RUN if [ "$GPU_ARCH" = "blackwell" ]; then \

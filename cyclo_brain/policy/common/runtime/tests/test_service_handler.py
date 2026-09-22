@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
@@ -14,14 +18,25 @@ if str(RUNTIME_ROOT) not in sys.path:
 
 from main_runtime.service_handler import (  # noqa: E402
     CMD_LOAD,
+    CMD_PAUSE,
+    CMD_RESET_CYCLE,
     CMD_RESUME,
     CMD_START,
+    CMD_STOP,
+    CMD_UNLOAD,
     ServiceHandler,
 )
 from main_runtime.session_state import SessionState  # noqa: E402
 
 
 class FakeRequester:
+    def __init__(self):
+        self.reset_cycle_count = 0
+        self.reset_cycle_response = SimpleNamespace(
+            success=True,
+            message="cycle reset",
+        )
+
     def load_policy(self, _request):
         return SimpleNamespace(
             success=True,
@@ -32,30 +47,70 @@ class FakeRequester:
     def unload_policy(self):
         return SimpleNamespace(success=True, message="unloaded")
 
+    def reset_policy_cycle(self):
+        self.reset_cycle_count += 1
+        return self.reset_cycle_response
+
 
 class FakeControlLoop:
     def __init__(self) -> None:
         self.configures = []
         self.starts = []
         self.task_instructions = []
+        self.start_result = False
+        self.start_error = None
+        self.pause_result = True
+        self.stop_result = True
+        self.hold_pending = False
+        self.deconfigure_count = 0
+        self.preflights = []
+        self.preflight_error = None
+        self.block_preflight = False
+        self.preflight_entered = threading.Event()
+        self.preflight_release = threading.Event()
+        self.stop_count = 0
 
     def configure(self, **kwargs) -> None:
         self.configures.append(kwargs)
 
-    def start(self, publish_to_robot=None) -> None:
+    def start(self, publish_to_robot=None) -> bool:
         self.starts.append(publish_to_robot)
+        if self.start_error is not None:
+            raise self.start_error
+        return self.start_result
+
+    def preflight_start(
+        self,
+        publish_to_robot,
+        task_instruction=None,
+        *,
+        continuation=False,
+    ) -> None:
+        self.preflights.append(
+            (publish_to_robot, task_instruction, continuation)
+        )
+        self.preflight_entered.set()
+        if self.block_preflight:
+            if not self.preflight_release.wait(timeout=2.0):
+                raise RuntimeError("test preflight release timed out")
+        if self.preflight_error is not None:
+            raise RuntimeError(self.preflight_error)
 
     def set_task_instruction(self, task_instruction: str) -> None:
         self.task_instructions.append(task_instruction)
 
-    def pause(self) -> None:
-        pass
+    def pause(self) -> bool:
+        return self.pause_result
 
-    def stop(self) -> None:
-        pass
+    def stop(self) -> bool:
+        self.stop_count += 1
+        return self.stop_result
 
     def deconfigure(self) -> None:
-        pass
+        self.deconfigure_count += 1
+
+    def initial_pose_sync_hold_required(self) -> bool:
+        return self.hold_pending
 
 
 def make_response(success, message="", action_keys=None):
@@ -70,9 +125,10 @@ class ServiceHandlerPublishModeTests(unittest.TestCase):
     def _handler(self):
         session = SessionState()
         loop = FakeControlLoop()
+        requester = FakeRequester()
         handler = ServiceHandler(
             session,
-            FakeRequester(),
+            requester,
             loop,
             make_response,
         )
@@ -120,6 +176,138 @@ class ServiceHandlerPublishModeTests(unittest.TestCase):
         self.assertTrue(response.success)
         self.assertEqual(loop.configures[0]["action_request_mode"], "sync")
 
+    def test_load_forwards_action_processing_timing(self) -> None:
+        handler, _session, loop = self._handler()
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+            control_hz=80,
+            inference_hz=20,
+            chunk_align_window_s=0.25,
+        ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(loop.configures[0]["control_hz"], 80)
+        self.assertEqual(loop.configures[0]["inference_hz"], 20)
+        self.assertEqual(loop.configures[0]["chunk_align_window_s"], 0.25)
+
+    def test_load_uses_zero_timing_for_legacy_request(self) -> None:
+        handler, _session, loop = self._handler()
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(loop.configures[0]["control_hz"], 0)
+        self.assertEqual(loop.configures[0]["inference_hz"], 0)
+        self.assertEqual(loop.configures[0]["chunk_align_window_s"], 0.0)
+
+    def test_load_configures_initial_pose_sync(self) -> None:
+        handler, _session, loop = self._handler()
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+            initial_pose_sync=True,
+            initial_pose_sync_duration_s=7.5,
+        ))
+
+        self.assertTrue(response.success)
+        self.assertTrue(loop.configures[0]["initial_pose_sync"])
+        self.assertEqual(loop.configures[0]["initial_pose_sync_duration_s"], 7.5)
+
+    def test_tactile_load_uses_ordered_async_even_for_stale_async(self) -> None:
+        handler, _session, loop = self._handler()
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "config.json").write_text(
+                '{"type": "tactile_act"}',
+                encoding="utf-8",
+            )
+            response = handler.handle(SimpleNamespace(
+                command=CMD_LOAD,
+                model_path=folder,
+                robot_type="ffw",
+                task_instruction="pick",
+                action_request_mode="async",
+            ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(
+            loop.configures[0]["action_request_mode"],
+            "async_ordered",
+        )
+
+    def test_tactile_load_overrides_later_ordered_async_ui_value(self) -> None:
+        handler, _session, loop = self._handler()
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "config.json").write_text(
+                '{"type": "tactile_act"}',
+                encoding="utf-8",
+            )
+            response = handler.handle(SimpleNamespace(
+                command=CMD_LOAD,
+                model_path=folder,
+                robot_type="ffw",
+                task_instruction="pick",
+                action_request_mode="async_ordered",
+            ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(
+            loop.configures[0]["action_request_mode"],
+            "async_ordered",
+        )
+
+    def test_legacy_async_vanilla_load_stays_async(self) -> None:
+        handler, _session, loop = self._handler()
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "config.json").write_text(
+                '{"type": "act"}',
+                encoding="utf-8",
+            )
+            response = handler.handle(SimpleNamespace(
+                command=CMD_LOAD,
+                model_path=folder,
+                robot_type="ffw",
+                task_instruction="pick",
+                action_request_mode="async",
+            ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(loop.configures[0]["action_request_mode"], "async")
+
+    def test_backend_env_can_force_runtime_profile(self) -> None:
+        handler, _session, loop = self._handler()
+        with patch.dict(
+            "os.environ",
+            {
+                "POLICY_ACTION_REQUEST_MODE_OVERRIDE": "async",
+                "POLICY_REFILL_MARGIN_S_OVERRIDE": "0.55",
+                "POLICY_SOURCE_CHUNK_LIMIT": "20",
+            },
+        ):
+            response = handler.handle(SimpleNamespace(
+                command=CMD_LOAD,
+                model_path="/models/dedicated-policy",
+                robot_type="ffw_sh5_rev1",
+                task_instruction="",
+                action_request_mode="sync",
+            ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(loop.configures[0]["action_request_mode"], "async")
+        self.assertEqual(loop.configures[0]["refill_margin_s"], 0.55)
+        self.assertEqual(loop.configures[0]["source_chunk_limit"], 20)
+
     def test_start_applies_publish_mode(self) -> None:
         handler, _session, loop = self._handler()
         handler.handle(SimpleNamespace(
@@ -137,6 +325,44 @@ class ServiceHandlerPublishModeTests(unittest.TestCase):
 
         self.assertTrue(response.success)
         self.assertEqual(loop.starts[-1], True)
+        self.assertEqual(loop.preflights[-1], (True, "pick", False))
+
+    def test_start_reports_syncing_and_marks_session_running(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        loop.start_result = True
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_START,
+            publish_to_robot=True,
+        ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.message, "syncing")
+        self.assertTrue(session.running)
+
+    def test_failed_initial_sync_does_not_mark_session_running(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        loop.start_error = RuntimeError("sync failed")
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_START,
+            publish_to_robot=True,
+        ))
+
+        self.assertFalse(response.success)
+        self.assertFalse(session.running)
 
     def test_resume_applies_publish_mode(self) -> None:
         handler, _session, loop = self._handler()
@@ -157,6 +383,322 @@ class ServiceHandlerPublishModeTests(unittest.TestCase):
         self.assertTrue(response.success)
         self.assertEqual(loop.starts[-1], True)
         self.assertEqual(loop.task_instructions[-1], "place")
+        self.assertEqual(loop.preflights[-1], (True, "place", True))
+
+    def test_reset_cycle_resets_episode_state_and_uses_fresh_preflight(self) -> None:
+        session = SessionState()
+        loop = FakeControlLoop()
+        requester = FakeRequester()
+        handler = ServiceHandler(session, requester, loop, make_response)
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        handler.handle(SimpleNamespace(command=CMD_START, publish_to_robot=False))
+        handler.handle(SimpleNamespace(command=CMD_PAUSE))
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_RESET_CYCLE,
+            task_instruction="",
+            publish_to_robot=True,
+        ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(requester.reset_cycle_count, 1)
+        self.assertEqual(loop.preflights[-1], (True, "pick", False))
+        self.assertEqual(loop.starts[-1], True)
+        self.assertTrue(session.running)
+        self.assertFalse(session.paused)
+
+    def test_reset_cycle_requires_paused_session(self) -> None:
+        session = SessionState()
+        loop = FakeControlLoop()
+        requester = FakeRequester()
+        handler = ServiceHandler(session, requester, loop, make_response)
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        handler.handle(SimpleNamespace(command=CMD_START, publish_to_robot=False))
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_RESET_CYCLE,
+            task_instruction="",
+            publish_to_robot=True,
+        ))
+
+        self.assertFalse(response.success)
+        self.assertIn("requires PAUSED", response.message)
+        self.assertEqual(requester.reset_cycle_count, 0)
+
+    def test_reset_cycle_engine_failure_stays_paused(self) -> None:
+        session = SessionState()
+        loop = FakeControlLoop()
+        requester = FakeRequester()
+        requester.reset_cycle_response = SimpleNamespace(
+            success=False,
+            message="tactile calibration failed",
+        )
+        handler = ServiceHandler(session, requester, loop, make_response)
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        handler.handle(SimpleNamespace(command=CMD_START, publish_to_robot=False))
+        handler.handle(SimpleNamespace(command=CMD_PAUSE))
+        starts_before = list(loop.starts)
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_RESET_CYCLE,
+            task_instruction="",
+            publish_to_robot=True,
+        ))
+
+        self.assertFalse(response.success)
+        self.assertIn("tactile calibration failed", response.message)
+        self.assertEqual(loop.starts, starts_before)
+        self.assertTrue(session.running)
+        self.assertTrue(session.paused)
+
+    def test_real_start_preflight_failure_is_returned_in_service_response(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        loop.preflight_error = "Real action preflight blocked: arm jump"
+
+        response = handler.handle(SimpleNamespace(
+            command=CMD_START,
+            publish_to_robot=True,
+        ))
+
+        self.assertFalse(response.success)
+        self.assertIn("arm jump", response.message)
+        self.assertFalse(session.running)
+        self.assertEqual(loop.starts, [])
+
+    def test_stop_waits_for_inflight_real_start_preflight(self) -> None:
+        handler, session, loop = self._handler()
+        load_response = handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        self.assertTrue(load_response.success)
+        loop.block_preflight = True
+        responses = {}
+
+        start_thread = threading.Thread(
+            target=lambda: responses.setdefault(
+                "start",
+                handler.handle(SimpleNamespace(
+                    command=CMD_START,
+                    publish_to_robot=True,
+                )),
+            )
+        )
+        start_thread.start()
+        self.assertTrue(loop.preflight_entered.wait(timeout=1.0))
+
+        stop_thread = threading.Thread(
+            target=lambda: responses.setdefault(
+                "stop",
+                handler.handle(SimpleNamespace(command=CMD_STOP)),
+            )
+        )
+        stop_thread.start()
+        time.sleep(0.05)
+
+        self.assertTrue(stop_thread.is_alive())
+        self.assertEqual(loop.stop_count, 0)
+
+        loop.preflight_release.set()
+        start_thread.join(timeout=1.0)
+        stop_thread.join(timeout=1.0)
+
+        self.assertFalse(start_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertTrue(responses["start"].success)
+        self.assertTrue(responses["stop"].success)
+        self.assertEqual(loop.stop_count, 1)
+        self.assertFalse(session.running)
+
+    def test_real_start_deadline_expiry_after_preflight_does_not_start(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+
+        with patch(
+            "main_runtime.service_handler.time.monotonic",
+            side_effect=[100.0, 101.0, 116.0],
+        ):
+            response = handler.handle(SimpleNamespace(
+                command=CMD_START,
+                publish_to_robot=True,
+            ))
+
+        self.assertFalse(response.success)
+        self.assertIn("deadline expired", response.message)
+        self.assertIn("publishing was not activated", response.message)
+        self.assertEqual(loop.preflights[-1], (True, "pick", False))
+        self.assertEqual(loop.starts, [])
+        self.assertFalse(session.running)
+
+    def test_real_resume_deadline_expiry_after_preflight_does_not_resume(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        handler.handle(SimpleNamespace(command=CMD_START, publish_to_robot=False))
+        handler.handle(SimpleNamespace(command=CMD_PAUSE))
+        starts_before = list(loop.starts)
+
+        with patch(
+            "main_runtime.service_handler.time.monotonic",
+            side_effect=[200.0, 201.0, 216.0],
+        ):
+            response = handler.handle(SimpleNamespace(
+                command=CMD_RESUME,
+                task_instruction="place",
+                publish_to_robot=True,
+            ))
+
+        self.assertFalse(response.success)
+        self.assertIn("deadline expired", response.message)
+        self.assertEqual(loop.preflights[-1], (True, "place", True))
+        self.assertEqual(loop.starts, starts_before)
+        self.assertTrue(session.running)
+        self.assertTrue(session.paused)
+        self.assertEqual(session.task_instruction, "pick")
+
+    def test_queued_real_start_expiry_skips_preflight(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+
+        with patch(
+            "main_runtime.service_handler.time.monotonic",
+            side_effect=[300.0, 316.0],
+        ):
+            response = handler.handle(SimpleNamespace(
+                command=CMD_START,
+                publish_to_robot=True,
+            ))
+
+        self.assertFalse(response.success)
+        self.assertEqual(loop.preflights, [])
+        self.assertEqual(loop.starts, [])
+        self.assertFalse(session.running)
+
+    def test_deadline_does_not_change_simulation_start(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+
+        with patch(
+            "main_runtime.service_handler.time.monotonic",
+            return_value=400.0,
+        ):
+            response = handler.handle(SimpleNamespace(
+                command=CMD_START,
+                publish_to_robot=False,
+            ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(loop.starts[-1], False)
+        self.assertTrue(session.running)
+
+    def test_real_start_deadline_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            ServiceHandler(
+                SessionState(),
+                FakeRequester(),
+                FakeControlLoop(),
+                make_response,
+                real_start_deadline_s=0.0,
+            )
+
+    def test_pause_marks_session_only_after_hold_succeeds(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        handler.handle(SimpleNamespace(command=CMD_START, publish_to_robot=True))
+        loop.pause_result = False
+
+        failed = handler.handle(SimpleNamespace(command=CMD_PAUSE))
+        self.assertFalse(failed.success)
+        self.assertTrue(session.running)
+        self.assertFalse(session.paused)
+
+        loop.pause_result = True
+        succeeded = handler.handle(SimpleNamespace(command=CMD_PAUSE))
+        self.assertTrue(succeeded.success)
+        self.assertTrue(session.paused)
+
+    def test_stop_keeps_session_running_when_hold_fails(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        handler.handle(SimpleNamespace(command=CMD_START, publish_to_robot=True))
+        loop.stop_result = False
+
+        failed = handler.handle(SimpleNamespace(command=CMD_STOP))
+        self.assertFalse(failed.success)
+        self.assertTrue(session.running)
+
+        loop.stop_result = True
+        succeeded = handler.handle(SimpleNamespace(command=CMD_STOP))
+        self.assertTrue(succeeded.success)
+        self.assertFalse(session.running)
+
+    def test_unload_is_blocked_while_current_pose_hold_is_pending(self) -> None:
+        handler, session, loop = self._handler()
+        handler.handle(SimpleNamespace(
+            command=CMD_LOAD,
+            model_path="/models/policy",
+            robot_type="ffw",
+            task_instruction="pick",
+        ))
+        loop.hold_pending = True
+
+        response = handler.handle(SimpleNamespace(command=CMD_UNLOAD))
+
+        self.assertFalse(response.success)
+        self.assertTrue(session.loaded)
+        self.assertEqual(loop.deconfigure_count, 0)
 
 
 if __name__ == "__main__":

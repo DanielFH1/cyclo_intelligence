@@ -273,6 +273,15 @@ class ConversionService:
             'selected_state_topics': list(getattr(request, 'selected_state_topics', []) or []),
             'selected_action_topics': list(getattr(request, 'selected_action_topics', []) or []),
             'selected_joints': list(getattr(request, 'selected_joints', []) or []),
+            'tactile_mode': str(
+                getattr(request, 'tactile_mode', '') or 'off'
+            ),
+            'selected_tactile_topics': list(
+                getattr(request, 'selected_tactile_topics', []) or []
+            ),
+            'tactile_baseline_samples': int(
+                getattr(request, 'tactile_baseline_samples', 0) or 20
+            ),
         }
 
         if not worker.send_request(request_data):

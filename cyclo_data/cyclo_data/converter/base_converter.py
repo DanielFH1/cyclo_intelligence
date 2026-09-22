@@ -76,10 +76,10 @@ _CONVERSION_WORKER_NICE_ENV = "CYCLO_CONVERSION_WORKER_NICE"
 _DEFAULT_VIDEO_SYNC_TOTAL_WORKERS = 6
 _VIDEO_SYNC_CLEAN_CACHE_ENV = "CYCLO_VIDEO_SYNC_CLEAN_CACHE"
 _EXTRACT_CACHE_DISABLE_ENV = "CYCLO_EXTRACT_CACHE_DISABLE"
-_EXTRACT_CACHE_VERSION = 2
+_EXTRACT_CACHE_VERSION = 5
 _RAW_CDR_EXTRACT_DISABLE_ENV = "CYCLO_EXTRACT_DISABLE_RAW_CDR"
 _PREPARED_EPISODE_CACHE_DISABLE_ENV = "CYCLO_PREPARED_EPISODE_CACHE_DISABLE"
-_PREPARED_EPISODE_CACHE_VERSION = 3
+_PREPARED_EPISODE_CACHE_VERSION = 6
 _VIDEO_COPY_MODE_ENV = "CYCLO_VIDEO_COPY_MODE"
 _VIDEO_STATS_SAMPLES_ENV = "CYCLO_VIDEO_STATS_SAMPLES"
 _CONVERTER_INFO_LOGS_ENV = "CYCLO_CONVERTER_INFO_LOGS"
@@ -382,6 +382,13 @@ class ConversionConfig:
     selected_state_topics: List[str] = field(default_factory=list)
     selected_action_topics: List[str] = field(default_factory=list)
     selected_joints: List[str] = field(default_factory=list)
+    # ``off`` preserves the A dataset contract. ``state_mean`` appends
+    # per-finger means to observation.state. ``separate_raw`` is the T-Rex
+    # contract: keep every 3x3 taxel in observation.tactile.<side> and store
+    # an episode-local no-contact baseline outside the robot state vector.
+    tactile_mode: str = "off"
+    selected_tactile_topics: List[str] = field(default_factory=list)
+    tactile_baseline_samples: int = 20
     # Audit metadata for the root info.json conversion_config snapshot.
     source_rosbags: List[str] = field(default_factory=list)
 
@@ -394,6 +401,8 @@ class EpisodeData:
     timestamps: List[float] = field(default_factory=list)
     observation_state: List[np.ndarray] = field(default_factory=list)
     action: List[np.ndarray] = field(default_factory=list)
+    tactile: Dict[str, List[np.ndarray]] = field(default_factory=dict)
+    tactile_baseline: Dict[str, List[np.ndarray]] = field(default_factory=dict)
     video_files: Dict[str, Path] = field(default_factory=dict)
     tasks: List[str] = field(default_factory=list)
     length: int = 0
@@ -415,6 +424,23 @@ class EpisodeData:
     observation_state_names: List[str] = field(default_factory=list)
     action_names: List[str] = field(default_factory=list)
 
+    def truncate(self, length: int) -> None:
+        """Trim every per-frame field to a common row count."""
+        length = max(0, int(length))
+        self.timestamps = self.timestamps[:length]
+        self.grid_log_times_sec = self.grid_log_times_sec[:length]
+        self.observation_state = self.observation_state[:length]
+        self.action = self.action[:length]
+        self.subtask_indices = self.subtask_indices[:length]
+        self.tactile = {
+            key: values[:length] for key, values in self.tactile.items()
+        }
+        self.tactile_baseline = {
+            key: values[:length]
+            for key, values in self.tactile_baseline.items()
+        }
+        self.length = length
+
 
 class RosbagToLerobotConverterBase:
     """
@@ -431,6 +457,19 @@ class RosbagToLerobotConverterBase:
     def __init__(self, config: ConversionConfig, logger=None):
         self.config = config
         self.logger = logger
+        config.tactile_mode = str(config.tactile_mode or "off").strip() or "off"
+        if config.tactile_mode not in {"off", "state_mean", "separate_raw"}:
+            raise ValueError(
+                "tactile_mode must be 'off', 'state_mean', or 'separate_raw', got "
+                f"{config.tactile_mode!r}"
+            )
+        if config.tactile_mode == "off" and config.selected_tactile_topics:
+            raise ValueError(
+                "selected_tactile_topics require tactile_mode to be "
+                "'state_mean' or 'separate_raw'"
+            )
+        if int(config.tactile_baseline_samples) <= 0:
+            raise ValueError("tactile_baseline_samples must be positive")
         self._metadata_manager = MetadataManager(logger)
         self._video_extractor = VideoMetadataExtractor(logger)
 
@@ -454,6 +493,8 @@ class RosbagToLerobotConverterBase:
         self._joint_order_by_group: Dict[str, List[str]] = {}  # group_key -> joint names
         self._state_topic_key_map: Dict[str, str] = {}  # topic -> group key
         self._action_topic_key_map: Dict[str, str] = {}  # topic -> group key
+        self._fixed_action_by_group: Dict[str, np.ndarray] = {}
+        self._tactile_topic_key_map: Dict[str, str] = {}  # topic -> tactile group key
 
         # Per-episode bisect-keys cache for ``_find_previous_value(_in_list)``.
         # Previously this lived in a mutable-default-arg dict on the method
@@ -852,17 +893,30 @@ class RosbagToLerobotConverterBase:
             return
 
         state_groups = robot_schema.get_state_groups(section)
+        tactile_groups = (
+            robot_schema.get_tactile_topics(section)
+            if self.config.tactile_mode != "off" else {}
+        )
         action_groups = robot_schema.get_action_groups(section)
+        recorded_action_groups = robot_schema.get_recorded_action_groups(section)
         image_groups = robot_schema.get_image_topics(section)
 
+        self._joint_order_by_group = {}
         state_topics: Dict[str, str] = {}
         for name, cfg in state_groups.items():
             key = f"follower_{name}"
             state_topics[key] = cfg["topic"]
             self._state_topic_key_map[cfg["topic"]] = key
+            self._joint_order_by_group[key] = list(cfg["joint_names"])
+
+        for name, cfg in tactile_groups.items():
+            key = f"tactile_{name}"
+            state_topics[key] = cfg["topic"]
+            self._state_topic_key_map[cfg["topic"]] = key
+            self._tactile_topic_key_map[cfg["topic"]] = key
 
         action_topics: Dict[str, str] = {}
-        for modality, cfg in action_groups.items():
+        for modality, cfg in recorded_action_groups.items():
             key = f"leader_{modality}"
             action_topics[key] = cfg["topic"]
             self._action_topic_key_map[cfg["topic"]] = key
@@ -887,15 +941,71 @@ class RosbagToLerobotConverterBase:
         # for _resolve_filter_target_names and the per-group merge logic.
         # Flat _joint_order is the concatenation in yaml insertion order.
         flattened: List[str] = []
-        self._joint_order_by_group = {}
+        self._fixed_action_by_group = {}
         for modality, cfg in action_groups.items():
             joints = list(cfg["joint_names"])
-            self._joint_order_by_group[f"leader_{modality}"] = joints
+            group_key = f"leader_{modality}"
+            self._joint_order_by_group[group_key] = joints
             flattened.extend(joints)
+            if cfg.get("record", True):
+                continue
+            width = 3 if cfg.get("msg_type") == "geometry_msgs/msg/Twist" else len(joints)
+            fixed_values = list(cfg.get("fixed_value") or [])
+            if len(fixed_values) != width:
+                self._log_warning(
+                    f"Fixed action {group_key} has {len(fixed_values)} value(s), "
+                    f"expected {width}; padding/truncating with zeros"
+                )
+                fixed_values = (fixed_values + [0.0] * width)[:width]
+            self._fixed_action_by_group[group_key] = np.asarray(
+                fixed_values,
+                dtype=np.float32,
+            )
         self._joint_order = flattened
         self._log_info(
             f"Loaded joint_order: {list(self._joint_order_by_group.keys())} "
             f"(total {len(self._joint_order)} joints)"
+        )
+
+    def _apply_legacy_joint_state_fallbacks(
+        self,
+        topic_types: Dict[str, str],
+    ) -> None:
+        """Read legacy /joint_states when a configured filtered state topic is absent.
+
+        SH5 recordings made before the right-arm/hand joint-state filter only
+        contain ``/joint_states``. The configured state group still lists the
+        exact right arm/hand ``joint_names``, so falling back to the raw joint
+        state topic preserves the LeRobot observation layout without changing
+        action topics or fixed action slices.
+        """
+        fallback_topic = "/joint_states"
+        if fallback_topic not in topic_types:
+            return
+        if "JointState" not in str(topic_types.get(fallback_topic, "")):
+            return
+
+        missing_groups: List[Tuple[str, str]] = []
+        for topic, group_key in self._state_topic_key_map.items():
+            if topic == fallback_topic:
+                return
+            if topic in self._tactile_topic_key_map:
+                continue
+            if topic in topic_types:
+                continue
+            if self._resolve_filter_target_names(group_key):
+                missing_groups.append((topic, group_key))
+
+        if len(missing_groups) != 1:
+            return
+
+        configured_topic, group_key = missing_groups[0]
+        if fallback_topic not in self.config.state_topics:
+            self.config.state_topics.append(fallback_topic)
+        self._state_topic_key_map[fallback_topic] = group_key
+        self._log_info(
+            f"State topic {configured_topic} not found; using "
+            f"{fallback_topic} for {group_key}"
         )
 
     def _joint_names_from_config(self, group_prefix: str) -> List[str]:
@@ -958,6 +1068,30 @@ class RosbagToLerobotConverterBase:
 
         return []
 
+    def _selected_camera_names(self) -> set[str]:
+        return set(self.config.selected_cameras or [])
+
+    def _camera_is_selected(self, camera_name: str) -> bool:
+        selected = self._selected_camera_names()
+        return not selected or camera_name in selected
+
+    @staticmethod
+    def _make_tactile_baseline_episode_constant(
+        episode: EpisodeData,
+    ) -> None:
+        """Keep one calibration baseline across a stitched logical episode."""
+        for side, raw_values in episode.tactile.items():
+            baseline_values = episode.tactile_baseline.get(side, [])
+            if not raw_values or not baseline_values:
+                continue
+            baseline = np.asarray(
+                baseline_values[0],
+                dtype=np.float32,
+            ).copy()
+            episode.tactile_baseline[side] = [
+                baseline.copy() for _ in raw_values
+            ]
+
     def _apply_selection_knobs(self) -> None:
         """Apply ConversionConfig selection lists to the discovered defaults.
 
@@ -965,6 +1099,32 @@ class RosbagToLerobotConverterBase:
         state_topics / action_topics / _joint_order / _camera_mapping.
         Empty selection lists are no-ops.
         """
+        # Camera subset.
+        if self.config.selected_cameras:
+            wanted = self._selected_camera_names()
+            kept_mapping = {
+                topic: camera_name
+                for topic, camera_name in self._camera_mapping.items()
+                if camera_name in wanted
+            }
+            if kept_mapping:
+                self._log_info(
+                    f"selected_cameras filter: "
+                    f"{len(self._camera_mapping)} -> {len(kept_mapping)}"
+                )
+                self._camera_mapping = kept_mapping
+                self._camera_rotations = {
+                    camera_name: rotation
+                    for camera_name, rotation in self._camera_rotations.items()
+                    if camera_name in wanted
+                }
+            else:
+                self._log_warning(
+                    f"selected_cameras {self.config.selected_cameras} "
+                    f"didn't match any of {list(self._camera_mapping.values())}; "
+                    f"keeping all"
+                )
+
         # State topic subset.
         if self.config.selected_state_topics:
             wanted = set(self.config.selected_state_topics)
@@ -981,6 +1141,30 @@ class RosbagToLerobotConverterBase:
                     f"didn't match any of {self.config.state_topics}; "
                     f"keeping all"
                 )
+
+        # Tactile selection is independent from regular robot state in the
+        # separate-raw contract. Re-add the selected tactile topics after a
+        # state-topic filter so a right-only joint state can coexist with the
+        # right pressure stream without becoming part of observation.state.
+        if self.config.tactile_mode == "separate_raw":
+            available_tactile = list(self._tactile_topic_key_map)
+            requested_tactile = list(
+                self.config.selected_tactile_topics or available_tactile
+            )
+            unknown_tactile = sorted(
+                set(requested_tactile) - set(available_tactile)
+            )
+            if unknown_tactile:
+                raise ValueError(
+                    "selected_tactile_topics are not present in the robot "
+                    f"config: {unknown_tactile}"
+                )
+            self.config.state_topics = [
+                topic
+                for topic in self.config.state_topics
+                if topic not in self._tactile_topic_key_map
+            ]
+            self.config.state_topics.extend(requested_tactile)
 
         # Action topic subset.
         if self.config.selected_action_topics:
@@ -1142,13 +1326,7 @@ class RosbagToLerobotConverterBase:
                             f"{target_frames} rows to match video frames "
                             f"(removing {excess} from end)"
                         )
-                        episode_data.timestamps = episode_data.timestamps[:target_frames]
-                        episode_data.observation_state = episode_data.observation_state[:target_frames]
-                        episode_data.action = episode_data.action[:target_frames]
-                        episode_data.grid_log_times_sec = (
-                            episode_data.grid_log_times_sec[:target_frames]
-                        )
-                        episode_data.length = target_frames
+                        episode_data.truncate(target_frames)
         elif not self.config.use_videos:
             episode_data.video_files = {}
 
@@ -1292,9 +1470,17 @@ class RosbagToLerobotConverterBase:
             "selected_state_topics": list(self.config.selected_state_topics),
             "selected_action_topics": list(self.config.selected_action_topics),
             "selected_joints": list(self.config.selected_joints),
+            "tactile_mode": self.config.tactile_mode,
+            "selected_tactile_topics": list(
+                self.config.selected_tactile_topics
+            ),
+            "tactile_baseline_samples": int(
+                self.config.tactile_baseline_samples
+            ),
             "joint_order": list(self._joint_order),
             "joint_order_by_group": self._joint_order_by_group,
             "state_topic_key_map": self._state_topic_key_map,
+            "tactile_topic_key_map": self._tactile_topic_key_map,
             "action_topic_key_map": self._action_topic_key_map,
             "quality_warning_multiplier": float(
                 self.config.quality_warning_multiplier
@@ -1566,6 +1752,8 @@ class RosbagToLerobotConverterBase:
             if mp4_file.stem.endswith("_synced"):
                 continue
             camera_name = self._get_camera_name_for_video(mp4_file.stem)
+            if not self._camera_is_selected(camera_name):
+                continue
             video_files.setdefault(camera_name, mp4_file)
         return video_files
 
@@ -1692,6 +1880,10 @@ class RosbagToLerobotConverterBase:
                 stitched.action_names = list(segment_episode.action_names or [])
             stitched.observation_state.extend(segment_episode.observation_state)
             stitched.action.extend(segment_episode.action)
+            for side, values in segment_episode.tactile.items():
+                stitched.tactile.setdefault(side, []).extend(values)
+            for side, values in segment_episode.tactile_baseline.items():
+                stitched.tactile_baseline.setdefault(side, []).extend(values)
             stitched.timestamps.extend(
                 [(frame_cursor + offset) / fps for offset in range(length)]
             )
@@ -1729,6 +1921,7 @@ class RosbagToLerobotConverterBase:
             frame_cursor = end_frame
 
         stitched.length = len(stitched.timestamps)
+        self._make_tactile_baseline_episode_constant(stitched)
         for camera, reports in frame_reuse_by_camera.items():
             merged = self._merge_frame_reuse_reports(
                 reports,
@@ -2091,6 +2284,10 @@ class RosbagToLerobotConverterBase:
             stitched.timestamps.extend(remapped)
             stitched.observation_state.extend(ep.observation_state)
             stitched.action.extend(ep.action)
+            for side, values in ep.tactile.items():
+                stitched.tactile.setdefault(side, []).extend(values)
+            for side, values in ep.tactile_baseline.items():
+                stitched.tactile_baseline.setdefault(side, []).extend(values)
             if ep.grid_log_times_sec:
                 base_grid = float(ep.grid_log_times_sec[0])
                 stitched.grid_log_times_sec.extend(
@@ -2099,6 +2296,7 @@ class RosbagToLerobotConverterBase:
             offset = (stitched.timestamps[-1] + step) if stitched.timestamps else offset
 
         stitched.length = len(stitched.timestamps)
+        self._make_tactile_baseline_episode_constant(stitched)
         stitched.subtask_indices = []
         stitched.subtask_segments = []
         cursor = 0
@@ -2347,6 +2545,29 @@ class RosbagToLerobotConverterBase:
             elif isinstance(topics, list):
                 self.config.state_topics = topics
 
+        if self.config.tactile_mode != "off" and "tactile_topics" in robot_config:
+            topics = robot_config["tactile_topics"]
+            tactile_values: List[str] = []
+            if isinstance(topics, dict):
+                for key, topic_path in topics.items():
+                    if isinstance(topic_path, dict):
+                        topic_path = topic_path.get("topic")
+                    if not topic_path:
+                        continue
+                    group_key = f"tactile_{key}"
+                    tactile_values.append(topic_path)
+                    self._state_topic_key_map[topic_path] = group_key
+                    self._tactile_topic_key_map[topic_path] = group_key
+            elif isinstance(topics, list):
+                tactile_values = list(topics)
+                for topic_path in tactile_values:
+                    group_key = topic_path.strip("/").replace("/", "_")
+                    self._state_topic_key_map[topic_path] = group_key
+                    self._tactile_topic_key_map[topic_path] = group_key
+            for topic_path in tactile_values:
+                if topic_path not in self.config.state_topics:
+                    self.config.state_topics.append(topic_path)
+
         if "action_topics" in robot_config:
             topics = robot_config["action_topics"]
             if isinstance(topics, dict):
@@ -2564,6 +2785,92 @@ class RosbagToLerobotConverterBase:
 
         return None, [], None, None
 
+    @staticmethod
+    def _is_tactile_topic_type(topic_type: str) -> bool:
+        return "robotis_interfaces/msg/HandPressures" in topic_type
+
+    @staticmethod
+    def _extract_tactile_mean_pooled(msg: Any) -> Optional[np.ndarray]:
+        """Mean-pool each 3x3 tactile sensor into one scalar per finger."""
+        sensors = getattr(msg, "sensors", None)
+        if not sensors:
+            return None
+
+        values: List[float] = []
+        for sensor in sensors:
+            raw_values = getattr(sensor, "pressure_values", None)
+            if raw_values is None:
+                values.append(0.0)
+                continue
+
+            if isinstance(raw_values, (bytes, bytearray, memoryview)):
+                arr = np.frombuffer(raw_values, dtype=np.uint8).astype(np.float32)
+            else:
+                arr = np.asarray(list(raw_values), dtype=np.float32)
+            values.append(float(np.mean(arr)) if arr.size else 0.0)
+
+        return np.asarray(values, dtype=np.float32)
+
+    @staticmethod
+    def _extract_tactile_taxels(msg: Any) -> Optional[np.ndarray]:
+        """Return all five 3x3 pressure grids as lossless float32 values."""
+        sensors = list(getattr(msg, "sensors", None) or [])
+        if not sensors:
+            return None
+
+        rows: List[np.ndarray] = []
+        for sensor in sensors:
+            raw_values = getattr(sensor, "pressure_values", None)
+            if raw_values is None:
+                values = np.zeros(9, dtype=np.float32)
+            elif isinstance(raw_values, (bytes, bytearray, memoryview)):
+                values = np.frombuffer(raw_values, dtype=np.uint8).astype(
+                    np.float32
+                )
+            else:
+                values = np.asarray(list(raw_values), dtype=np.float32)
+            if values.size != 9:
+                raise ValueError(
+                    "HandPressures requires exactly 9 taxels per sensor, "
+                    f"got {values.size}"
+                )
+            rows.append(values.reshape(3, 3))
+        if len(rows) != 5:
+            raise ValueError(
+                "SH5 T-Rex tactile contract requires exactly 5 finger "
+                f"sensors, got {len(rows)}"
+            )
+        return np.stack(rows).astype(np.float32, copy=False)
+
+    def _tactile_feature_side(self, topic: str) -> str:
+        group = (
+            self._tactile_topic_key_map.get(topic)
+            or topic.strip("/").replace("/", "_")
+        )
+        normalized = group.lower()
+        for side in ("right", "left"):
+            if side in normalized:
+                return side
+        raise ValueError(
+            f"Cannot infer tactile side from topic/group: {topic!r}/{group!r}"
+        )
+
+    def _extract_tactile_names(self, topic: str, msg: Any) -> List[str]:
+        group_key = (
+            self._tactile_topic_key_map.get(topic)
+            or self._state_topic_key_map.get(topic)
+            or topic.strip("/").replace("/", "_")
+        )
+        sensors = getattr(msg, "sensors", None) or []
+        names: List[str] = []
+        for index, sensor in enumerate(sensors):
+            sensor_name = str(
+                getattr(sensor, "sensor_name", "") or f"finger_{index + 1}"
+            )
+            safe_sensor_name = sensor_name.replace("/", "_").replace(" ", "_")
+            names.append(f"{group_key}_{safe_sensor_name}_mean")
+        return names
+
     def _get_topic_group_key(self, topic: str, role: str) -> str:
         """Get the group key for a topic, using config mapping or deriving from path."""
         if role == "state" and topic in self._state_topic_key_map:
@@ -2619,12 +2926,6 @@ class RosbagToLerobotConverterBase:
                 role = "action"
             if not role:
                 continue
-            if not self._raw_cdr_topic_supported(topic_type):
-                self._log_info(
-                    f"Raw CDR extraction does not support {topic_type}; "
-                    "falling back to ROS decoder"
-                )
-                return None
 
             fallback_names: List[str] = []
             if "Odometry" in topic_type or "Twist" in topic_type:
@@ -2647,6 +2948,14 @@ class RosbagToLerobotConverterBase:
                 "header.stamp timestamps; using ROS decoder instead"
             )
             return None
+
+        for _, topic_type, _ in topic_plan.values():
+            if not self._raw_cdr_topic_supported(topic_type):
+                self._log_info(
+                    f"Raw CDR extraction does not support {topic_type}; "
+                    "falling back to ROS decoder"
+                )
+                return None
 
         position_layout_cache: Dict[str, Tuple[int, int, List[str]]] = {}
         exclude_windows = [
@@ -2830,10 +3139,14 @@ class RosbagToLerobotConverterBase:
         # Group both state and action messages by topic
         state_messages_by_topic: Dict[str, List[Tuple[float, np.ndarray]]] = {}
         state_joint_names_by_topic: Dict[str, List[str]] = {}
+        tactile_messages_by_topic: Dict[
+            str, List[Tuple[float, np.ndarray]]
+        ] = {}
         action_messages_by_topic: Dict[str, List[Tuple[float, np.ndarray]]] = {}
         action_joint_names_by_topic: Dict[str, List[str]] = {}
 
         topic_types = reader.get_topic_types()
+        self._apply_legacy_joint_state_fallbacks(topic_types)
 
         # Build topic filter to avoid decoding unnecessary messages (TF, CameraInfo, etc.)
         topics_to_read = None
@@ -2863,13 +3176,41 @@ class RosbagToLerobotConverterBase:
             for topic, msg, timestamp in reader.read_messages(topic_filter=topics_to_read):
                 topic_type = topic_types.get(topic, "")
 
+                if (
+                    self.config.tactile_mode == "separate_raw"
+                    and topic in self._tactile_topic_key_map
+                    and self._is_tactile_topic_type(topic_type)
+                ):
+                    taxels = self._extract_tactile_taxels(msg)
+                    if taxels is None:
+                        continue
+                    sample_timestamp, used_header_stamp = (
+                        self._message_header_timestamp_sec(msg, timestamp)
+                    )
+                    if not used_header_stamp:
+                        state_log_time_fallback_topics.add(topic)
+                    if self._timestamp_is_selected(
+                        sample_timestamp,
+                        trim_start,
+                        trim_end,
+                        exclude_regions,
+                    ):
+                        tactile_messages_by_topic.setdefault(topic, []).append(
+                            (sample_timestamp, taxels)
+                        )
+                    continue
+
                 # Process state topics
                 if self._is_state_topic(topic, topic_types):
                     positions = None
                     joint_names = []
                     need_joint_names = topic not in state_joint_names_by_topic
 
-                    if "Odometry" in topic_type:
+                    if self._is_tactile_topic_type(topic_type):
+                        positions = self._extract_tactile_mean_pooled(msg)
+                        if need_joint_names:
+                            joint_names = self._extract_tactile_names(topic, msg)
+                    elif "Odometry" in topic_type:
                         positions = self._extract_velocity_from_odometry(msg)
                         if need_joint_names:
                             group_key = self._get_topic_group_key(topic, "state")
@@ -2955,12 +3296,23 @@ class RosbagToLerobotConverterBase:
             action_messages_by_topic, action_joint_names_by_topic
         )
 
+        if (
+            self.config.tactile_mode == "separate_raw"
+            and not tactile_messages_by_topic
+        ):
+            self._log_warning(f"No tactile messages found in {bag_path}")
+            return None
+
         if not state_messages:
             self._log_warning(f"No valid merged state messages in {bag_path}")
             return None
 
         episode, staleness_metrics = self._resample_to_fps(
-            episode, state_messages, action_messages, trim_start
+            episode,
+            state_messages,
+            action_messages,
+            trim_start,
+            tactile_messages_by_topic=tactile_messages_by_topic,
         )
         episode.observation_state_names = list(self._state_joint_names or [])
         episode.action_names = list(self._action_joint_names or [])
@@ -3033,6 +3385,14 @@ class RosbagToLerobotConverterBase:
             "joint_order": list(self._joint_order),
             "joint_order_by_group": self._joint_order_by_group,
             "state_topic_key_map": self._state_topic_key_map,
+            "tactile_topic_key_map": self._tactile_topic_key_map,
+            "tactile_mode": self.config.tactile_mode,
+            "selected_tactile_topics": list(
+                self.config.selected_tactile_topics
+            ),
+            "tactile_baseline_samples": int(
+                self.config.tactile_baseline_samples
+            ),
             "action_topic_key_map": self._action_topic_key_map,
             "quality_warning_multiplier": float(
                 self.config.quality_warning_multiplier
@@ -3147,6 +3507,11 @@ class RosbagToLerobotConverterBase:
         if "Odometry" in topic_type:
             if not is_action_indicator:
                 return True
+        if (
+            self.config.tactile_mode == "state_mean"
+            and self._is_tactile_topic_type(topic_type)
+        ):
+            return True
         return False
 
     def _is_action_topic(self, topic: str, topic_types: Dict[str, str]) -> bool:
@@ -3274,6 +3639,11 @@ class RosbagToLerobotConverterBase:
         """Merge action messages from multiple topics into a single action vector."""
         if not action_messages_by_topic:
             return []
+        if self._fixed_action_by_group:
+            return self._merge_action_messages_with_fixed_groups(
+                action_messages_by_topic,
+                action_joint_names_by_topic,
+            )
 
         # Determine topic ordering using group keys
         topic_to_group: Dict[str, str] = {}
@@ -3361,6 +3731,118 @@ class RosbagToLerobotConverterBase:
                         timestamp,
                         np.concatenate(combined_parts).astype(
                             np.float32, copy=False
+                        ),
+                    )
+                )
+
+        return merged_messages
+
+    def _merge_action_messages_with_fixed_groups(
+        self,
+        action_messages_by_topic: Dict[str, List[Tuple[float, np.ndarray]]],
+        action_joint_names_by_topic: Dict[str, List[str]],
+    ) -> List[Tuple[float, np.ndarray]]:
+        """Merge recorded action topics and fixed, non-recorded action slices."""
+        topic_to_group = {
+            topic: self._get_topic_group_key(topic, "action")
+            for topic in action_messages_by_topic
+        }
+        group_to_topic = {group: topic for topic, group in topic_to_group.items()}
+
+        ordered_groups = [
+            group
+            for group in self._joint_order_by_group
+            if group.startswith("leader_")
+        ]
+        if not ordered_groups:
+            ordered_groups = sorted(group_to_topic)
+
+        recorded_topics = [
+            group_to_topic[group]
+            for group in ordered_groups
+            if group in group_to_topic
+        ]
+        if not recorded_topics:
+            return []
+
+        combined_names: List[str] = []
+        for group in ordered_groups:
+            if group in self._joint_order_by_group:
+                combined_names.extend(self._joint_order_by_group[group])
+                continue
+            topic = group_to_topic.get(group)
+            if topic:
+                combined_names.extend(action_joint_names_by_topic.get(topic, []))
+        self._action_joint_names = combined_names
+
+        filter_indices_by_group: Dict[str, Optional[np.ndarray]] = {}
+        filter_failed_groups = set()
+        for group in ordered_groups:
+            topic = group_to_topic.get(group)
+            if topic is None:
+                continue
+            if group not in self._joint_order_by_group:
+                filter_indices_by_group[group] = None
+                continue
+            group_names = action_joint_names_by_topic.get(topic, [])
+            if not group_names:
+                filter_indices_by_group[group] = None
+                continue
+            indices = self._joint_order_index_array(
+                group_names,
+                self._joint_order_by_group[group],
+            )
+            if indices is None:
+                filter_failed_groups.add(group)
+            filter_indices_by_group[group] = indices
+
+        reference_topic = recorded_topics[0]
+        reference_timestamps = [t for t, _ in action_messages_by_topic[reference_topic]]
+        message_times_by_topic = {
+            topic: [t for t, _ in action_messages_by_topic[topic]]
+            for topic in recorded_topics
+        }
+        cursor_by_topic = {topic: -1 for topic in recorded_topics}
+
+        merged_messages: List[Tuple[float, np.ndarray]] = []
+        for timestamp in reference_timestamps:
+            combined_parts: List[np.ndarray] = []
+            all_groups_have_data = True
+
+            for group in ordered_groups:
+                fixed = self._fixed_action_by_group.get(group)
+                if fixed is not None:
+                    combined_parts.append(fixed)
+                    continue
+
+                topic = group_to_topic.get(group)
+                if topic is None or group in filter_failed_groups:
+                    all_groups_have_data = False
+                    break
+
+                msgs = action_messages_by_topic[topic]
+                times = message_times_by_topic[topic]
+                idx = cursor_by_topic[topic]
+                while idx + 1 < len(times) and times[idx + 1] <= timestamp:
+                    idx += 1
+                cursor_by_topic[topic] = idx
+                if idx < 0 or (timestamp - times[idx]) > 0.05:
+                    all_groups_have_data = False
+                    break
+
+                prev_value = msgs[idx][1]
+                indices = filter_indices_by_group.get(group)
+                if indices is not None:
+                    prev_value = prev_value[indices]
+                combined_parts.append(prev_value)
+
+            if all_groups_have_data and combined_parts:
+                merged_messages.append(
+                    (
+                        timestamp,
+                        np.concatenate(combined_parts).astype(
+                            np.float32,
+                            copy=False,
                         ),
                     )
                 )
@@ -3564,12 +4046,45 @@ class RosbagToLerobotConverterBase:
         state_messages: List[Tuple[float, np.ndarray]],
         action_messages: List[Tuple[float, np.ndarray]],
         start_time: float,
+        tactile_messages_by_topic: Optional[
+            Dict[str, List[Tuple[float, np.ndarray]]]
+        ] = None,
     ) -> Tuple[EpisodeData, Dict[str, StalenessMetrics]]:
         """Resample messages to target FPS using causal sync (previous value only)."""
         staleness_metrics: Dict[str, StalenessMetrics] = {
             "observation.state": StalenessMetrics(topic="observation.state"),
             "action": StalenessMetrics(topic="action"),
         }
+        tactile_messages_by_topic = tactile_messages_by_topic or {}
+        tactile_by_side: Dict[str, List[Tuple[float, np.ndarray]]] = {}
+        tactile_baselines: Dict[str, np.ndarray] = {}
+        for topic, messages in tactile_messages_by_topic.items():
+            if not messages:
+                continue
+            side = self._tactile_feature_side(topic)
+            ordered = sorted(messages, key=lambda item: item[0])
+            if side in tactile_by_side:
+                raise ValueError(
+                    f"Multiple tactile topics resolved to side={side!r}"
+                )
+            tactile_by_side[side] = ordered
+            baseline_count = int(self.config.tactile_baseline_samples)
+            if len(ordered) < baseline_count:
+                raise ValueError(
+                    f"Tactile topic {topic!r} has {len(ordered)} sample(s), "
+                    f"but tactile_baseline_samples={baseline_count} requires "
+                    "that many episode-local samples"
+                )
+            baseline_stack = np.stack(
+                [value for _, value in ordered[:baseline_count]], axis=0
+            )
+            tactile_baselines[side] = np.rint(
+                np.median(baseline_stack, axis=0)
+            ).astype(np.float32)
+            feature_key = f"observation.tactile.{side}"
+            staleness_metrics[feature_key] = StalenessMetrics(
+                topic=feature_key
+            )
 
         if not state_messages:
             return episode, staleness_metrics
@@ -3592,6 +4107,11 @@ class RosbagToLerobotConverterBase:
                     f"action_start={first_action_time:.3f}, "
                     f"effective_start={effective_min_time:.3f}"
                 )
+        if tactile_by_side:
+            first_tactile_time = max(
+                messages[0][0] for messages in tactile_by_side.values()
+            )
+            effective_min_time = max(effective_min_time, first_tactile_time)
 
         frame_duration = 1.0 / self.config.fps
         num_frames = int((max_time - effective_min_time) * self.config.fps) + 1
@@ -3658,10 +4178,44 @@ class RosbagToLerobotConverterBase:
             else:
                 action = np.zeros(len(state), dtype=np.float32)
 
+            tactile_frame: Dict[str, np.ndarray] = {}
+            tactile_valid = True
+            for side, messages in tactile_by_side.items():
+                value, tactile_staleness_ms = self._find_previous_value(
+                    messages, target_time, frame_duration
+                )
+                if value is None:
+                    tactile_valid = False
+                    break
+                key = f"observation.tactile.{side}"
+                metrics = staleness_metrics[key]
+                metrics.total_samples += 1
+                self._track_staleness(
+                    metrics,
+                    frame_idx,
+                    tactile_staleness_ms,
+                    warning_threshold_ms,
+                    error_threshold_ms,
+                )
+                metrics.max_staleness_ms = max(
+                    metrics.max_staleness_ms, tactile_staleness_ms
+                )
+                metrics.mean_staleness_ms += tactile_staleness_ms
+                tactile_frame[side] = np.asarray(
+                    value, dtype=np.float32
+                ).reshape(5, 3, 3)
+            if not tactile_valid:
+                continue
+
             episode.timestamps.append(relative_time)
             episode.grid_log_times_sec.append(target_time)
             episode.observation_state.append(state)
             episode.action.append(action)
+            for side, value in tactile_frame.items():
+                episode.tactile.setdefault(side, []).append(value)
+                episode.tactile_baseline.setdefault(side, []).append(
+                    tactile_baselines[side].copy()
+                )
 
         episode.length = len(episode.timestamps)
 
@@ -3680,6 +4234,11 @@ class RosbagToLerobotConverterBase:
             staleness_metrics["action"].max_staleness_ms = float(
                 np.max(action_staleness_values)
             )
+
+        for side in tactile_by_side:
+            metrics = staleness_metrics[f"observation.tactile.{side}"]
+            if metrics.total_samples:
+                metrics.mean_staleness_ms /= metrics.total_samples
 
         return episode, staleness_metrics
 
@@ -4287,18 +4846,7 @@ class RosbagToLerobotConverterBase:
                             f"{mismatched}"
                         )
                     if min_frames < episode.length:
-                        episode.timestamps = episode.timestamps[:min_frames]
-                        if episode.observation_state:
-                            episode.observation_state = (
-                                episode.observation_state[:min_frames]
-                            )
-                        if episode.action:
-                            episode.action = episode.action[:min_frames]
-                        if episode.grid_log_times_sec:
-                            episode.grid_log_times_sec = (
-                                episode.grid_log_times_sec[:min_frames]
-                            )
-                        episode.length = min_frames
+                        episode.truncate(min_frames)
                     # Trim any mp4 longer than min_frames.
                     for cam_name, video_path in synced.items():
                         if counts.get(cam_name, min_frames) <= min_frames:
@@ -4394,6 +4942,8 @@ class RosbagToLerobotConverterBase:
                 if mp4_file.stem.endswith("_synced"):
                     continue
                 camera_name = self._get_camera_name_for_video(mp4_file.stem)
+                if not self._camera_is_selected(camera_name):
+                    continue
                 if camera_name not in video_files:
                     video_files[camera_name] = mp4_file
 
@@ -4428,6 +4978,12 @@ class RosbagToLerobotConverterBase:
                         for path in sorted(video_dir.glob("*.mp4"))
                         if not path.stem.endswith("_synced")
                     ]
+                cameras = [
+                    camera for camera in cameras
+                    if self._camera_is_selected(camera)
+                ]
+                if not cameras:
+                    continue
                 ordered.append((video_dir, set(cameras)))
         else:
             videos_root = bag_path / "videos"
@@ -4450,6 +5006,10 @@ class RosbagToLerobotConverterBase:
                         path.stem
                         for path in sorted(video_dir.glob("*.mp4"))
                         if not path.stem.endswith("_synced")
+                    ]
+                    cameras = [
+                        camera for camera in cameras
+                        if self._camera_is_selected(camera)
                     ]
                     if cameras:
                         ordered.append((video_dir, set(cameras)))
@@ -5074,6 +5634,68 @@ class RosbagToLerobotConverterBase:
                 ),
             }
 
+        tactile_sides = sorted(
+            {
+                side
+                for episode in episodes_data
+                for side, values in episode.tactile.items()
+                if values
+            }
+        )
+        if self.config.tactile_mode == "separate_raw" and not tactile_sides:
+            raise ValueError(
+                "tactile_mode='separate_raw' requires at least one tactile "
+                "feature in every converted episode"
+            )
+        for side in tactile_sides:
+            for episode in episodes_data:
+                raw_values = episode.tactile.get(side, [])
+                baseline_values = episode.tactile_baseline.get(side, [])
+                if len(raw_values) != episode.length:
+                    raise ValueError(
+                        f"Episode {episode.episode_index} has "
+                        f"{len(raw_values)} observation.tactile.{side} row(s), "
+                        f"expected {episode.length}"
+                    )
+                if len(baseline_values) != episode.length:
+                    raise ValueError(
+                        f"Episode {episode.episode_index} has "
+                        f"{len(baseline_values)} "
+                        f"observation.tactile_baseline.{side} row(s), "
+                        f"expected {episode.length}"
+                    )
+                for feature_name, rows in (
+                    (f"observation.tactile.{side}", raw_values),
+                    (
+                        f"observation.tactile_baseline.{side}",
+                        baseline_values,
+                    ),
+                ):
+                    for frame_index, row in enumerate(rows):
+                        width = int(np.asarray(row).size)
+                        if width != 45:
+                            raise ValueError(
+                                f"Episode {episode.episode_index} "
+                                f"{feature_name}[{frame_index}] must contain "
+                                f"45 taxels, got {width}"
+                            )
+            taxel_names = [
+                f"{side}_finger_{finger + 1}_taxel_{row}_{column}"
+                for finger in range(5)
+                for row in range(3)
+                for column in range(3)
+            ]
+            self._features[f"observation.tactile.{side}"] = {
+                "dtype": "float32",
+                "shape": (45,),
+                "names": taxel_names,
+            }
+            self._features[f"observation.tactile_baseline.{side}"] = {
+                "dtype": "float32",
+                "shape": (45,),
+                "names": taxel_names,
+            }
+
         # Add video features. LeRobot v2.1 spec: shape is CHW (3, H, W),
         # names track shape order, and an ``info`` block carries codec /
         # pix_fmt / fps / dimensions / has_audio for downstream loaders.
@@ -5139,6 +5761,12 @@ class RosbagToLerobotConverterBase:
             self._action_topic_key_map,
             strip_prefix='leader_',
         )
+        tactile_topics = self._audit_topic_selection(
+            list(self.config.selected_tactile_topics),
+            list(self._tactile_topic_key_map),
+            self._tactile_topic_key_map,
+            strip_prefix='tactile_',
+        )
         task_name = self._root_task_name()
         # Camera rotations — include every known camera with an explicit
         # 0 for unrotated, mirroring the reference dataset's snapshot.
@@ -5171,6 +5799,12 @@ class RosbagToLerobotConverterBase:
                     if self.config.image_resize else None
                 ),
                 'selected_joint_state_topics': state_topics,
+                'selected_joints': list(self.config.selected_joints),
+                'tactile_mode': self.config.tactile_mode,
+                'selected_tactile_topics': tactile_topics,
+                'tactile_baseline_samples': int(
+                    self.config.tactile_baseline_samples
+                ),
                 'primitive_instructions': [],
                 'selected_action_topics': action_topics,
             },
@@ -5240,6 +5874,37 @@ class RosbagToLerobotConverterBase:
                 "std": np.maximum(np.std(actions, axis=0), STATS_STD_FLOOR).tolist(),
                 "min": np.min(actions, axis=0).tolist(),
                 "max": np.max(actions, axis=0).tolist(),
+                "count": [num_frames],
+            }
+
+        for side, values in episode.tactile.items():
+            if not values:
+                continue
+            tactile = np.asarray(values, dtype=np.float32).reshape(
+                len(values), -1
+            )
+            stats[f"observation.tactile.{side}"] = {
+                "mean": np.mean(tactile, axis=0).tolist(),
+                "std": np.maximum(
+                    np.std(tactile, axis=0), STATS_STD_FLOOR
+                ).tolist(),
+                "min": np.min(tactile, axis=0).tolist(),
+                "max": np.max(tactile, axis=0).tolist(),
+                "count": [num_frames],
+            }
+        for side, values in episode.tactile_baseline.items():
+            if not values:
+                continue
+            baseline = np.asarray(values, dtype=np.float32).reshape(
+                len(values), -1
+            )
+            stats[f"observation.tactile_baseline.{side}"] = {
+                "mean": np.mean(baseline, axis=0).tolist(),
+                "std": np.maximum(
+                    np.std(baseline, axis=0), STATS_STD_FLOOR
+                ).tolist(),
+                "min": np.min(baseline, axis=0).tolist(),
+                "max": np.max(baseline, axis=0).tolist(),
                 "count": [num_frames],
             }
 

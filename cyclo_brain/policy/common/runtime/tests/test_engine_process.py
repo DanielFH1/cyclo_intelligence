@@ -17,6 +17,7 @@ if str(RUNTIME_ROOT) not in sys.path:
 from engine_process.protocol import (  # noqa: E402
     CMD_GET_ACTION,
     CMD_LOAD_POLICY,
+    CMD_RESET_POLICY,
     CMD_UNLOAD_POLICY,
     EngineCommandRequest,
 )
@@ -28,6 +29,7 @@ class FakeEngine:
         self.loaded_with = None
         self.action_requested_with = None
         self.cleaned = False
+        self.reset_count = 0
 
     @property
     def is_ready(self) -> bool:
@@ -54,6 +56,14 @@ class FakeEngine:
 
     def cleanup(self) -> None:
         self.cleaned = True
+
+    def reset_cycle(self) -> dict:
+        self.reset_count += 1
+        return {
+            "success": True,
+            "message": "cycle reset",
+            "action_keys": ["arm", "gripper"],
+        }
 
 
 class EngineWorkerTests(unittest.TestCase):
@@ -123,6 +133,27 @@ class EngineWorkerTests(unittest.TestCase):
         self.assertTrue(response.success)
         self.assertEqual(response.seq_id, 13)
         self.assertTrue(engine.cleaned)
+
+    def test_reset_cycle_keeps_engine_loaded(self) -> None:
+        engine = FakeEngine()
+        worker = EngineWorker(engine)
+        worker.handle(EngineCommandRequest(
+            command=CMD_LOAD_POLICY,
+            seq_id=1,
+            model_path="/models/policy",
+            robot_type="ffw",
+        ))
+
+        response = worker.handle(EngineCommandRequest(
+            command=CMD_RESET_POLICY,
+            seq_id=14,
+        ))
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.seq_id, 14)
+        self.assertEqual(response.action_keys, ["arm", "gripper"])
+        self.assertEqual(engine.reset_count, 1)
+        self.assertFalse(engine.cleaned)
 
 
 if __name__ == "__main__":

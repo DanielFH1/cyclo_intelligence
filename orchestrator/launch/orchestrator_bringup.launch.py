@@ -81,5 +81,10 @@ def generate_launch_description():
         orchestrator_launch,
         rosbridge_websocket_node,
         rosbag_recorder_node,
-        web_video_server_node
+        web_video_server_node,
+        Node(
+            package='cyclo_data', executable='camera_preview_node',
+            name='camera_preview', output='screen',
+            parameters=[{'port': _env_int('CYCLO_CAMERA_PREVIEW_PORT', '7086')}],
+        ),
     ])

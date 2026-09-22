@@ -23,19 +23,29 @@ import { MdKeyboardDoubleArrowLeft, MdKeyboardDoubleArrowRight, MdViewInAr } fro
 import RecordControlPanel from '../components/RecordControlPanel';
 import HeartbeatStatus from '../components/HeartbeatStatus';
 import InlineSystemStatus from '../components/InlineSystemStatus';
-import ImageGrid from '../components/ImageGrid';
+import RecordCameraPanel from '../components/RecordCameraPanel';
 import RobotViewer3D from '../components/RobotViewer3D';
 import SegmentPanel from '../components/SegmentPanel';
 import RecordTopicMonitor from '../components/RecordTopicMonitor';
+import TactileHandsPanel from '../components/TactileHandsPanel';
+import HandPresetControl from '../components/HandPresetControl';
+import { selectInferenceTaskInfo } from '../features/tasks/taskSlice';
 import { setIsFirstLoadFalse } from '../features/ui/uiSlice';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
+import { usesTactileInput } from '../constants/policyCapabilities';
 
 export default function RecordPage({ isActive = true }) {
   const dispatch = useDispatch();
   const { sendRecordCommand } = useRosServiceCaller();
 
   const robotType = useSelector((state) => state.tasks.robotType);
+  const inferenceInfo = useSelector(selectInferenceTaskInfo);
   const joystickMode = useSelector((state) => state.tasks.joystickMode);
+  const isSh5RobotConnected = String(robotType || '').toLowerCase().includes('sh5');
+  const tactileEnabled = isSh5RobotConnected && usesTactileInput(
+    inferenceInfo.serviceType,
+    inferenceInfo.policyType
+  );
 
   // Toast limit implementation using useToasterStore
   const { toasts } = useToasterStore();
@@ -184,7 +194,7 @@ export default function RecordPage({ isActive = true }) {
             <div className={classHeartbeatStatus}>
               <HeartbeatStatus />
             </div>
-            <ImageGrid isActive={isActive} />
+            <RecordCameraPanel isActive={isActive} />
           </div>
           <div className="flex-[4] min-h-[120px] flex flex-row items-center justify-center mx-1 gap-2 h-full relative">
             {show3DViewer && (
@@ -192,6 +202,8 @@ export default function RecordPage({ isActive = true }) {
                 <RobotViewer3D mode="live" />
               </div>
             )}
+            <TactileHandsPanel enabled={isActive && tactileEnabled} />
+            <HandPresetControl enabled={isActive && isSh5RobotConnected} />
             <div className="h-[85%]" style={{ aspectRatio: '4/3' }}>
               <RecordTopicMonitor />
             </div>

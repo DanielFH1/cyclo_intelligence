@@ -7,6 +7,15 @@
 uint8 LOAD_POLICY   = 0
 uint8 GET_ACTION    = 1
 uint8 UNLOAD_POLICY = 2
+# Start a new logical episode without reloading model weights. The Engine
+# resets stateful policy/preprocessor/action-overlap state, reconnects sensor
+# inputs, and recalibrates episode-scoped tactile baselines.
+uint8 RESET_POLICY  = 3
+# Backend opt-in: replace weights without reconnecting/calibrating sensors.
+uint8 SWITCH_POLICY = 4
+uint8 PRELOAD_POLICY = 5
+uint8 CLEAR_PRELOAD = 6
+uint8 SWITCH_PRELOADED = 7
 
 uint8 command
 

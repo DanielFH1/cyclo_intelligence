@@ -27,6 +27,11 @@ if os.path.exists(_ZENOH_SDK_PATH) and _ZENOH_SDK_PATH not in sys.path:
 from .protocol import (
     CMD_GET_ACTION,
     CMD_LOAD_POLICY,
+    CMD_RESET_POLICY,
+    CMD_SWITCH_POLICY,
+    CMD_PRELOAD_POLICY,
+    CMD_CLEAR_PRELOAD,
+    CMD_SWITCH_PRELOADED,
     CMD_UNLOAD_POLICY,
     ENGINE_COMMAND_REQUEST_DEF,
     ENGINE_COMMAND_RESPONSE_DEF,
@@ -36,6 +41,7 @@ from .protocol import (
     request_from_message,
     response_to_message_kwargs,
 )
+from policy_logging import configure_policy_runtime_logging
 
 
 try:  # pragma: no cover - exercised only in container runtime.
@@ -62,8 +68,15 @@ class EngineWorker:
         self._engine = engine
         self._service = None
         self._shutdown = threading.Event()
+        # A timed-out GET_ACTION can still be computing. Never replace its
+        # policy (or sensor state) until that engine operation has finished.
+        self._command_lock = threading.Lock()
 
     def handle(self, request: Any) -> EngineCommandResponse:
+        with self._command_lock:
+            return self._handle_locked(request)
+
+    def _handle_locked(self, request: Any) -> EngineCommandResponse:
         req = (
             request
             if isinstance(request, EngineCommandRequest)
@@ -76,6 +89,25 @@ class EngineWorker:
                 return self._get_action(req)
             if req.command == CMD_UNLOAD_POLICY:
                 return self._unload_policy(req)
+            if req.command == CMD_RESET_POLICY:
+                return self._reset_policy(req)
+            optional_operations = {
+                CMD_SWITCH_POLICY: "switch_policy",
+                CMD_PRELOAD_POLICY: "preload_policy",
+                CMD_CLEAR_PRELOAD: "clear_preload",
+                CMD_SWITCH_PRELOADED: "switch_preloaded_policy",
+            }
+            if req.command in optional_operations:
+                switch = getattr(self._engine, optional_operations[req.command], None)
+                if switch is None:
+                    raise RuntimeError("Backend does not support in-session model switching")
+                result = switch(req)
+                return EngineCommandResponse(
+                    success=bool(result.get("success", False)),
+                    seq_id=req.seq_id,
+                    message=str(result.get("message", "")),
+                    action_keys=list(result.get("action_keys", []) or []),
+                )
             return EngineCommandResponse(
                 success=False,
                 seq_id=req.seq_id,
@@ -124,6 +156,15 @@ class EngineWorker:
             success=True,
             seq_id=request.seq_id,
             message="unloaded",
+        )
+
+    def _reset_policy(self, request: EngineCommandRequest) -> EngineCommandResponse:
+        result = self._engine.reset_cycle()
+        return EngineCommandResponse(
+            success=bool(result.get("success", False)),
+            seq_id=request.seq_id,
+            message=str(result.get("message", "")),
+            action_keys=list(result.get("action_keys", []) or []),
         )
 
     def make_ros_callback(self):
@@ -194,6 +235,7 @@ def resolve_engine() -> Any:
 
 
 def main() -> None:  # pragma: no cover - container entrypoint.
+    configure_policy_runtime_logging()
     backend = os.environ.get("POLICY_BACKEND", "").strip() or "policy"
     worker = EngineWorker(resolve_engine())
     try:

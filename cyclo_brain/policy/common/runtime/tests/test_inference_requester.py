@@ -29,6 +29,16 @@ class FakeEngineClient:
 
 
 class InferenceRequesterTests(unittest.TestCase):
+    def test_get_action_default_timeout_is_five_seconds(self) -> None:
+        client = FakeEngineClient(
+            [EngineCommandResponse(success=True, seq_id=1)]
+        )
+        requester = InferenceRequester(client)
+
+        requester.get_action("initial or regular inference")
+
+        self.assertEqual(client.calls[0][1], 5.0)
+
     def test_load_policy_default_timeout_is_long_enough_for_model_load(self) -> None:
         client = FakeEngineClient(
             [EngineCommandResponse(success=True, seq_id=1)]
@@ -110,6 +120,23 @@ class InferenceRequesterTests(unittest.TestCase):
         self.assertIn("stale", response.message)
         self.assertEqual(response.action_list, [])
         self.assertFalse(requester.has_pending_get_action())
+
+    def test_reset_cycle_uses_engine_reset_command_and_long_timeout(self) -> None:
+        client = FakeEngineClient([
+            EngineCommandResponse(
+                success=True,
+                seq_id=1,
+                message="cycle reset",
+            )
+        ])
+        requester = InferenceRequester(client)
+
+        response = requester.reset_policy_cycle()
+
+        self.assertTrue(response.success)
+        request, timeout_s = client.calls[0]
+        self.assertEqual(request.command, 3)
+        self.assertEqual(timeout_s, 7200.0)
 
 
 if __name__ == "__main__":

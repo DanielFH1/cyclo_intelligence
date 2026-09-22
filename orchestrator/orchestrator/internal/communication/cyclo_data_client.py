@@ -138,6 +138,9 @@ class CycloDataClient:
         selected_action_topics=None,
         selected_joints=None,
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+        tactile_mode: str = 'off',
+        selected_tactile_topics=None,
+        tactile_baseline_samples: int = 20,
     ) -> CallResult:
         req = StartConversion.Request()
         req.dataset_path = dataset_path
@@ -172,6 +175,9 @@ class CycloDataClient:
         req.selected_state_topics = list(selected_state_topics or [])
         req.selected_action_topics = list(selected_action_topics or [])
         req.selected_joints = list(selected_joints or [])
+        req.tactile_mode = str(tactile_mode or 'off')
+        req.selected_tactile_topics = list(selected_tactile_topics or [])
+        req.tactile_baseline_samples = int(tactile_baseline_samples or 20)
 
         return self._call(self._convert, req, timeout_sec, 'convert')
 

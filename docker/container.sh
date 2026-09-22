@@ -6,10 +6,12 @@
 # Usage:
 #   docker/container.sh start              # → cyclo_intelligence
 #   docker/container.sh start-lerobot      # → lerobot (idle until LOAD)
+#   docker/container.sh start-vitacformer  # → vitacformer (idle until LOAD)
 #   docker/container.sh start-groot        # → groot (idle until LOAD)
 #   docker/container.sh enter              # → shell in cyclo_intelligence
 #   docker/container.sh build-ui           # → rebuild React UI only
 #   docker/container.sh enter-lerobot      # → shell in lerobot_server
+#   docker/container.sh enter-vitacformer  # → shell in vitacformer_server
 #   docker/container.sh enter-groot        # → shell in groot_server
 #   docker/container.sh logs               # → compose logs -f
 #   docker/container.sh status             # → s6 svstat on all containers
@@ -20,6 +22,65 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE="docker compose -f ${SCRIPT_DIR}/docker-compose.yml"
+
+# The default LeRobot image intentionally stays unchanged.  T-Rex has a
+# different pinned dependency set, so opt into its small Compose override via
+# the shell or docker/.env without changing the normal launch path.
+LEROBOT_POLICY_FLAVOR="${CYCLO_LEROBOT_POLICY_FLAVOR:-}"
+if [ -z "${LEROBOT_POLICY_FLAVOR}" ] && [ -f "${SCRIPT_DIR}/.env" ]; then
+    LEROBOT_POLICY_FLAVOR=$(sed -n \
+        's/^[[:space:]]*CYCLO_LEROBOT_POLICY_FLAVOR[[:space:]]*=[[:space:]]*//p' \
+        "${SCRIPT_DIR}/.env" | tail -n 1)
+fi
+LEROBOT_POLICY_FLAVOR="${LEROBOT_POLICY_FLAVOR:-default}"
+
+case "${LEROBOT_POLICY_FLAVOR}" in
+    default)
+        ;;
+    trex)
+        if [ ! -f "${SCRIPT_DIR}/docker-compose.trex.yml" ]; then
+            echo "[container.sh] Error: missing docker-compose.trex.yml" >&2
+            exit 2
+        fi
+        COMPOSE="${COMPOSE} -f ${SCRIPT_DIR}/docker-compose.trex.yml"
+        ;;
+    *)
+        echo "[container.sh] Error: CYCLO_LEROBOT_POLICY_FLAVOR must be 'default' or 'trex'" >&2
+        exit 2
+        ;;
+esac
+export CYCLO_LEROBOT_POLICY_FLAVOR="${LEROBOT_POLICY_FLAVOR}"
+export LEROBOT_POLICY_FLAVOR="${LEROBOT_POLICY_FLAVOR}"
+
+# Runtime tuning is independent from the policy image flavor.  Keep the
+# historical behavior unless a profile is explicitly selected, then layer the
+# profile after every other Compose file so its runtime values win.
+LEROBOT_RUNTIME_PROFILE="${CYCLO_LEROBOT_RUNTIME_PROFILE:-}"
+if [ -z "${LEROBOT_RUNTIME_PROFILE}" ] && [ -f "${SCRIPT_DIR}/.env" ]; then
+    LEROBOT_RUNTIME_PROFILE=$(sed -n \
+        's/^[[:space:]]*CYCLO_LEROBOT_RUNTIME_PROFILE[[:space:]]*=[[:space:]]*//p' \
+        "${SCRIPT_DIR}/.env" | tail -n 1)
+fi
+LEROBOT_RUNTIME_PROFILE="${LEROBOT_RUNTIME_PROFILE:-default}"
+LEROBOT_RUNTIME_OVERRIDE=""
+
+case "${LEROBOT_RUNTIME_PROFILE}" in
+    default)
+        ;;
+    hand-act)
+        LEROBOT_RUNTIME_OVERRIDE="${SCRIPT_DIR}/docker-compose.hand-act.yml"
+        if [ ! -f "${LEROBOT_RUNTIME_OVERRIDE}" ]; then
+            echo "[container.sh] Error: missing docker-compose.hand-act.yml" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "[container.sh] Error: CYCLO_LEROBOT_RUNTIME_PROFILE must be 'default' or 'hand-act'" >&2
+        exit 2
+        ;;
+esac
+export CYCLO_LEROBOT_RUNTIME_PROFILE="${LEROBOT_RUNTIME_PROFILE}"
+
 # Standard docker-compose override convention. Auto-discovery is
 # disabled when -f is passed explicitly (above), so we re-enable it
 # manually: if a sibling docker-compose.override.yml exists, layer it
@@ -28,10 +89,17 @@ COMPOSE="docker compose -f ${SCRIPT_DIR}/docker-compose.yml"
 [ -f "${SCRIPT_DIR}/docker-compose.override.yml" ] \
     && COMPOSE="${COMPOSE} -f ${SCRIPT_DIR}/docker-compose.override.yml"
 
+# Runtime profiles must be last: local, policy-flavor, and standard override
+# files may contain generic defaults that the selected profile must replace.
+[ -n "${LEROBOT_RUNTIME_OVERRIDE}" ] \
+    && COMPOSE="${COMPOSE} -f ${LEROBOT_RUNTIME_OVERRIDE}"
+
 MAIN_SERVICE="cyclo_intelligence"
 MAIN_CONTAINER="cyclo_intelligence"
 LEROBOT_SERVICE="lerobot"
 LEROBOT_CONTAINER="${LEROBOT_CONTAINER_NAME:-lerobot_server}"
+VITACFORMER_SERVICE="vitacformer"
+VITACFORMER_CONTAINER="${VITACFORMER_CONTAINER_NAME:-vitacformer_server}"
 GROOT_SERVICE="groot"
 GROOT_CONTAINER="${GROOT_CONTAINER_NAME:-groot_server}"
 
@@ -99,6 +167,7 @@ prepare_host_mounts() {
     ensure_host_dir "${workspace_dir}/lerobot"
     ensure_host_dir "${workspace_dir}/model"
     ensure_host_dir "${workspace_dir}/model/lerobot"
+    ensure_host_dir "${workspace_dir}/model/vitacformer"
     ensure_host_dir "${workspace_dir}/model/groot"
     ensure_host_dir "$huggingface_dir"
 
@@ -183,6 +252,7 @@ remove_stale_policy_container() {
 
 remove_stale_policy_containers() {
     remove_stale_policy_container "$LEROBOT_SERVICE" "$LEROBOT_CONTAINER"
+    remove_stale_policy_container "$VITACFORMER_SERVICE" "$VITACFORMER_CONTAINER"
     remove_stale_policy_container "$GROOT_SERVICE" "$GROOT_CONTAINER"
 }
 
@@ -200,6 +270,13 @@ LeRobot policy container:
                    only configures itself once orchestrator dispatches
                    InferenceCommand.LOAD with a robot_type.
   enter-lerobot    Open an interactive bash in lerobot_server
+
+ViTacFormer policy container:
+  start-vitacformer
+                   Build + start the dedicated ViTacFormer backend. Container
+                   boots idle and configures itself on LOAD.
+  enter-vitacformer
+                   Open an interactive bash in vitacformer_server
 
 GR00T policy container:
   start-groot      Build + start groot (N1.7 baseline). Same boot-idle
@@ -225,6 +302,10 @@ Flags (any start* command):
                    required). Use this only when iterating on Dockerfile.
 
 Environment:
+  CYCLO_LEROBOT_POLICY_FLAVOR
+                   default | trex (default: default)
+  CYCLO_LEROBOT_RUNTIME_PROFILE
+                   default | hand-act (default: default)
   GPU_ARCH         default | blackwell   (optional, amd64 only)
   FLASH_ATTN_BUILD_JOBS
                    flash-attn source build parallelism for GR00T Blackwell
@@ -234,7 +315,7 @@ Environment:
   FLASH_ATTN_CUDA_ARCHS
                    CUDA archs for GR00T Blackwell flash-attn builds
                    (default 120)
-  VERSION          image tag version (default: 1.3.0 for cyclo)
+  VERSION          image tag version (default: 1.4.0 for cyclo)
   ROS/Zenoh        Edit /root/.bashrc inside each container, then restart that
                    container. docker restart preserves edits; recreating the
                    container resets /root/.bashrc to the image default.
@@ -259,18 +340,46 @@ main_container_has_npm() {
         && docker exec "$MAIN_CONTAINER" sh -lc 'command -v npm >/dev/null 2>&1'
 }
 
+main_container_ui_accessible() {
+    main_container_has_npm \
+        && docker exec \
+            -u "$(id -u):$(id -g)" \
+            -w /tmp \
+            "$MAIN_CONTAINER" \
+            sh -c 'exec head -c 1 "$1" >/dev/null 2>&1' sh "$(main_ui_dir)/package.json"
+}
+
 enter_bash() {
     local container="$1"
     docker exec -it "$container" bash
 }
 
 run_ui_npm_in_main() {
+    local root_mode npm_status restore_status
+
+    # The checkout is mounted below /root in the main container.  Docker
+    # applies --user before entering the requested workdir, so the host user
+    # cannot traverse the container's default mode-0700 /root directory.
+    # Grant traverse-only permission for the duration of npm, then restore the
+    # exact original mode even when npm exits unsuccessfully.
+    root_mode="$(docker exec "$MAIN_CONTAINER" stat -c '%a' /root)"
+    docker exec "$MAIN_CONTAINER" chmod o+x /root
+
+    npm_status=0
     docker exec \
         -u "$(id -u):$(id -g)" \
         -e HOME=/tmp \
         -w "$(main_ui_dir)" \
         "$MAIN_CONTAINER" \
-        npm "$@"
+        npm "$@" || npm_status=$?
+
+    restore_status=0
+    docker exec "$MAIN_CONTAINER" chmod "$root_mode" /root \
+        || restore_status=$?
+    if [ "$npm_status" -ne 0 ]; then
+        return "$npm_status"
+    fi
+    return "$restore_status"
 }
 
 run_ui_npm_external() {
@@ -286,7 +395,7 @@ run_ui_npm_external() {
 }
 
 run_ui_npm() {
-    if main_container_has_npm; then
+    if main_container_ui_accessible; then
         run_ui_npm_in_main "$@"
     else
         run_ui_npm_external "$@"
@@ -295,8 +404,12 @@ run_ui_npm() {
 
 ensure_ui_dependencies() {
     local dir
-    if main_container_has_npm; then
-        if docker exec "$MAIN_CONTAINER" test -x "$(main_ui_dir)/node_modules/.bin/react-scripts"; then
+    if main_container_ui_accessible; then
+        if docker exec \
+            -u "$(id -u):$(id -g)" \
+            -w /tmp \
+            "$MAIN_CONTAINER" \
+            test -x "$(main_ui_dir)/node_modules/.bin/react-scripts"; then
             return 0
         fi
 
@@ -390,6 +503,21 @@ start_lerobot() {
     $COMPOSE up -d $BUILD_FLAG "$LEROBOT_SERVICE"
 }
 
+start_vitacformer() {
+    prepare_host_mounts
+    setup_x11
+    if [ -n "$BUILD_FLAG" ]; then
+        echo "[container.sh] Building $VITACFORMER_SERVICE from local Dockerfile; skipping pre-built image pull."
+    else
+        echo "[container.sh] Pulling pre-built images..."
+        echo "[container.sh] Local Dockerfile changes are ignored without --build."
+        $COMPOSE pull --ignore-pull-failures "$VITACFORMER_SERVICE" || true
+    fi
+    remove_stale_policy_container "$VITACFORMER_SERVICE" "$VITACFORMER_CONTAINER"
+    echo "[container.sh] Starting $VITACFORMER_SERVICE (ARCH=$ARCH${BUILD_FLAG:+, rebuild on})..."
+    $COMPOSE up -d $BUILD_FLAG "$VITACFORMER_SERVICE"
+}
+
 start_groot() {
     prepare_host_mounts
     setup_x11
@@ -422,6 +550,14 @@ enter_lerobot() {
     enter_bash "$LEROBOT_CONTAINER"
 }
 
+enter_vitacformer() {
+    if ! container_running "$VITACFORMER_CONTAINER"; then
+        echo "Error: $VITACFORMER_CONTAINER is not running. Run 'start-vitacformer' first." >&2
+        exit 1
+    fi
+    enter_bash "$VITACFORMER_CONTAINER"
+}
+
 enter_groot() {
     if ! container_running "$GROOT_CONTAINER"; then
         echo "Error: $GROOT_CONTAINER is not running. Run 'start-groot' first." >&2
@@ -437,7 +573,7 @@ show_logs() {
 show_status() {
     echo "=== Containers ==="
     docker ps --format '{{.Names}}\t{{.Status}}' \
-        | grep -E "^(${MAIN_CONTAINER}|${LEROBOT_CONTAINER}|${GROOT_CONTAINER})\\b" \
+        | grep -E "^(${MAIN_CONTAINER}|${LEROBOT_CONTAINER}|${VITACFORMER_CONTAINER}|${GROOT_CONTAINER})\\b" \
         || echo "(none running)"
 
     # s6-overlay installs s6-svstat under /package/admin/s6-*/command/
@@ -462,7 +598,7 @@ show_status() {
         " || true
     fi
 
-    for cont in "$LEROBOT_CONTAINER" "$GROOT_CONTAINER"; do
+    for cont in "$LEROBOT_CONTAINER" "$VITACFORMER_CONTAINER" "$GROOT_CONTAINER"; do
         if container_running "$cont"; then
             echo ""
             # Not every policy container uses s6-overlay (e.g. lerobot
@@ -499,9 +635,11 @@ stop_all() {
 case "${1:-help}" in
     start)           start_main ;;
     start-lerobot)   start_lerobot ;;
+    start-vitacformer) start_vitacformer ;;
     start-groot)     start_groot ;;
     enter)           enter_main ;;
     enter-lerobot)   enter_lerobot ;;
+    enter-vitacformer) enter_vitacformer ;;
     enter-groot)     enter_groot ;;
     build-ui)        build_ui ;;
     test-ui)         shift; test_ui "$@" ;;

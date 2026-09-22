@@ -77,7 +77,7 @@ _stub_module(
     DataOperationStatus=_DataOperationStatus,
     RecordingStatus=_RecordingStatus,
 )
-_stub_module("interfaces.srv", RecordingCommand=_RecordingCommand)
+_stub_module("interfaces.srv", RecordingCommand=_RecordingCommand, RecordingCameras=_Dummy)
 _stub_module("cyclo_data.recorder.camera_info_snapshot", CameraInfoSnapshot=_Dummy)
 _stub_module("cyclo_data.recorder.rosbag_control", RosbagControl=_Dummy)
 _stub_module("cyclo_data.recorder.transcoder", TranscodeWorker=_Dummy)
@@ -544,3 +544,107 @@ def test_cancel_segment_rejects_when_no_active_recording():
     assert result is response
     assert response.success is False
     assert response.message == "CANCEL_SEGMENT: no active recording"
+
+
+def _camera_service(tmp_path, monkeypatch):
+    from cyclo_data.recorder.camera_selection import CameraSelection
+    service, _ = _service_with_logger()
+    service._camera_selection = CameraSelection(tmp_path / 'cameras.json')
+    service._robot_type = 'sh5'
+    service._video_robot_type = ''
+    service._video_camera_selection = None
+    service._data_manager = None
+    service._session_lock = RLock()
+    service._finish_episode_in_progress = lambda: False
+    service._video_recorder = None
+    service._camera_info = None
+    section = {'observation': {'images': {
+        name: {'topic': f'/{name}/image/compressed', 'rotation_deg': rotation}
+        for name, rotation in [('cam_left_head', 0), ('cam_left_wrist', 270),
+                               ('cam_right_wrist', 270), ('cam_right_head', 0)]
+    }}, 'recording': {'extra_topics': [
+        f'/{name}/camera_info' for name in (
+            'cam_left_head', 'cam_left_wrist', 'cam_right_wrist', 'cam_right_head')
+    ]}}
+    monkeypatch.setattr(recording_service_module.robot_schema, 'load_robot_section', lambda _: section)
+    return service
+
+
+def test_recording_defaults_to_four_cameras_independent_of_inference(tmp_path, monkeypatch):
+    service = _camera_service(tmp_path, monkeypatch)
+    service._recording_camera_profile = 'cam_left_head'  # Legacy inference hint is irrelevant.
+    images, info, rotations = service._resolve_video_topics('sh5')
+    assert len(images) == len(info) == len(rotations) == 4
+    assert rotations['cam_left_wrist'] == 270
+
+
+def test_camera_service_applies_subset_and_all_off_to_real_pipeline(tmp_path, monkeypatch):
+    service = _camera_service(tmp_path, monkeypatch)
+    class Recorder:
+        def __init__(self, node, cameras=None, camera_info_topics=None, **kwargs):
+            self.topics = cameras if cameras is not None else camera_info_topics
+        def reconfigure(self, topics):
+            self.topics = topics
+    monkeypatch.setattr(recording_service_module, 'VideoRecorder', Recorder)
+    monkeypatch.setattr(recording_service_module, 'CameraInfoSnapshot', Recorder)
+    for cameras in (['cam_left_head', 'cam_right_wrist'], []):
+        result = service._camera_configuration_callback(
+            SimpleNamespace(robot_type='sh5', apply=True, enabled_cameras=cameras),
+            SimpleNamespace(),
+        )
+        assert result.success
+        assert result.enabled_cameras == cameras
+        assert set(service._video_recorder.topics) == set(cameras)
+        assert set(service._camera_info.topics) == set(cameras)
+        assert set(service._last_camera_rotations) == set(cameras)
+    from cyclo_data.recorder.camera_selection import CameraSelection
+    assert CameraSelection(service._camera_selection.path).enabled('sh5', result.camera_names) == []
+
+
+def test_camera_service_rejects_changes_while_recording_or_saving(tmp_path, monkeypatch):
+    service = _camera_service(tmp_path, monkeypatch)
+    for phase in (_RecordingStatus.RECORDING, _RecordingStatus.SAVING):
+        service._data_manager = SimpleNamespace(
+            is_recording=lambda: phase == _RecordingStatus.RECORDING,
+            get_current_record_status=lambda: SimpleNamespace(record_phase=phase),
+        )
+        result = service._camera_configuration_callback(
+            SimpleNamespace(robot_type='sh5', apply=True, enabled_cameras=[]), SimpleNamespace())
+        assert not result.success
+        assert result.locked
+        assert service._camera_selection.robots == {}
+
+
+def test_camera_service_rejects_unknown_camera_and_wrong_robot(tmp_path, monkeypatch):
+    service = _camera_service(tmp_path, monkeypatch)
+    for robot, names in [('sh5', ['typo']), ('other', [])]:
+        result = service._camera_configuration_callback(
+            SimpleNamespace(robot_type=robot, apply=True, enabled_cameras=names), SimpleNamespace())
+        assert not result.success
+        assert service._camera_selection.robots == {}
+
+
+def test_camera_service_rolls_back_when_pipeline_or_save_fails(tmp_path, monkeypatch):
+    service = _camera_service(tmp_path, monkeypatch)
+    calls = []
+    def pipeline(robot):
+        calls.append(service._camera_selection.enabled(robot, ['cam_left_head', 'cam_right_head']))
+        if len(calls) == 1:
+            raise RuntimeError('cannot subscribe')
+    service._ensure_video_pipeline = pipeline
+    result = service._camera_configuration_callback(
+        SimpleNamespace(robot_type='sh5', apply=True, enabled_cameras=[]), SimpleNamespace())
+    assert not result.success
+    assert calls == [[], ['cam_left_head', 'cam_right_head']]
+    assert service._camera_selection.robots == {}
+    assert not service._camera_selection.path.exists()
+
+
+def test_camera_service_read_does_not_reconfigure_or_save(tmp_path, monkeypatch):
+    service = _camera_service(tmp_path, monkeypatch)
+    service._ensure_video_pipeline = lambda _: (_ for _ in ()).throw(AssertionError('read mutated pipeline'))
+    result = service._camera_configuration_callback(
+        SimpleNamespace(robot_type='sh5', apply=False, enabled_cameras=[]), SimpleNamespace())
+    assert result.success
+    assert len(result.enabled_cameras) == 4
+    assert not service._camera_selection.path.exists()

@@ -2,6 +2,27 @@
 Changelog for package cyclo_intelligence
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.0 (2026-08-31)
+------------------
+* Added Autonomy Studio: Mission Canvas and Action Canvas replace the Navigation and BT Manager pages.
+* Added map-based missions: waypoint routes, per-waypoint behavior trees, named missions with manifests and revisions.
+* Added a Navigation stage, AMCL localization through the supervisor API, map editing, and saved-map deletion.
+* Added ArmStateGate, per-joint JointControl, and SendCommand inference lifecycle control.
+* Improved navigation map streaming and rendering performance.
+* Separated the BT engine from the orchestrator control plane: ``bt_node`` owns ``/bt/*``, saved trees live under ``CYCLO_BT_TREES_DIR`` via ``/api/bt/trees``, and the supported robot list is defined once in ``shared.robot_configs.schema``.
+* Updated image support to ``robotis/cyclo-intelligence:1.4.0``.
+* Contributors: Seongwoo Kim
+
+1.3.1 (2026-08-26)
+------------------
+* Forwarded UI ``Dataset FPS`` (service ``inference_hz``), ``Control Hz``, and ``Chunk Align Window`` settings from UI and behavior trees to the LeRobot and GR00T action-processing runtimes.
+* Added timing-aware policy reloads so changed action-processing settings cannot reuse stale runtime configuration.
+* Added optional Initial Pose Sync with a dedicated ``SYNCING`` phase, fresh-joint validation, and retryable current-pose hold before pause or teardown.
+* Renamed the UI timing label to ``Dataset FPS`` and added non-blocking warnings for unusual dataset or control rates.
+* Removed the fixed policy backend warm-up delay and made backend ON idempotent while keeping Restart explicit.
+* Updated image support to ``robotis/cyclo-intelligence:1.3.1``, ``robotis/lerobot-zenoh:1.4.1``, and ``robotis/groot-zenoh:1.3.5``. These images form one service-interface release set and cannot be mixed with older versions.
+* Contributors: Taehyeong Kim
+
 1.3.0 (2026-08-14)
 ------------------
 * Updated the LeRobot integration to 0.6.1 with MolmoAct2, VLA-JEPA, and FastWAM inference support.

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Author: Kiwoong Park
+// Author: Kiwoong Park, Seongwoo Kim
 
 import { useCallback, useRef, useEffect } from 'react';
 import { shallowEqual, useSelector } from 'react-redux';
@@ -24,13 +24,17 @@ import EditDatasetCommand from '../constants/commands';
 import rosConnectionManager from '../utils/rosConnectionManager';
 import { DEFAULT_PATHS } from '../constants/paths';
 import {
+  defaultInferenceHz,
+  resolveActionRequestMode,
+} from '../constants/policyCapabilities';
+import {
   selectInferenceTaskInfo,
   selectRecordTaskInfo,
 } from '../features/tasks/taskSlice';
 import { CYCLO_VIDEO_SERVER_PORT } from '../config/runtimeConfig';
 
 const DEFAULT_SERVICE_TIMEOUT_MS = 10000;
-const START_INFERENCE_SERVICE_TIMEOUT_MS = 30000;
+const INFERENCE_START_RESUME_SERVICE_TIMEOUT_MS = 30000;
 const NO_SERVICE_TIMEOUT_MS = 0;
 
 const LONG_RECORDING_COMMANDS = new Set([
@@ -47,6 +51,15 @@ const LONG_RECORDING_COMMANDS = new Set([
   'discard_episode',
   'stop_inference_record',
   'cancel_inference_record',
+  'switch_inference_model',
+  'preload_inference_model',
+  'clear_preloaded_model',
+  'switch_preloaded_model',
+]);
+
+const INFERENCE_START_RESUME_COMMANDS = new Set([
+  'start_inference',
+  'resume_inference',
 ]);
 
 export function getRecordCommandServiceTimeoutMs(command, options = {}) {
@@ -57,9 +70,51 @@ export function getRecordCommandServiceTimeoutMs(command, options = {}) {
   if (LONG_RECORDING_COMMANDS.has(command)) {
     return NO_SERVICE_TIMEOUT_MS;
   }
-  return command === 'start_inference'
-    ? START_INFERENCE_SERVICE_TIMEOUT_MS
+  return INFERENCE_START_RESUME_COMMANDS.has(command)
+    ? INFERENCE_START_RESUME_SERVICE_TIMEOUT_MS
     : DEFAULT_SERVICE_TIMEOUT_MS;
+}
+
+export function getTaskInfoInferenceHz(taskInfo = {}) {
+  const value = Number(taskInfo.inferenceHz);
+  if (Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  return defaultInferenceHz(taskInfo.serviceType, taskInfo.policyType);
+}
+
+export function getConversionCommandRequestFields(command, options = {}) {
+  // These fields belong to CONVERT_MP4 only.  Sending them with inference
+  // commands makes a newer UI incompatible with a running SendCommand type
+  // generated before the conversion schema gained tactile options.
+  if (command !== 'convert_mp4') {
+    return {};
+  }
+
+  const cameraRotations = options.cameraRotations || {};
+  const cameraRotationKeys = Object.keys(cameraRotations);
+  const imageResize = options.imageResize || null;
+
+  return {
+    conversion_fps: Number(options.conversionFps || 0),
+    convert_v21: Boolean(options.convertV21),
+    convert_v30: Boolean(options.convertV30),
+    selected_cameras: [],
+    camera_rotation_keys: cameraRotationKeys,
+    camera_rotation_values: cameraRotationKeys.map(
+      (key) => Number(cameraRotations[key] || 0),
+    ),
+    image_resize_height: Number(imageResize?.height || 0),
+    image_resize_width: Number(imageResize?.width || 0),
+    selected_state_topics: [],
+    selected_action_topics: [],
+    selected_joints: [],
+    tactile_mode: String(options.tactileMode || 'off'),
+    selected_tactile_topics: Array.isArray(options.selectedTactileTopics)
+      ? options.selectedTactileTopics
+      : [],
+    tactile_baseline_samples: Number(options.tactileBaselineSamples || 20),
+  };
 }
 
 export function transformReplayDataResult(result = {}, bagPath = '') {
@@ -109,6 +164,15 @@ export function transformReplayDataResult(result = {}, bagPath = '') {
     has_raw_images: result.has_raw_images || false,
     raw_image_topics: result.raw_image_topics || [],
     mcap_file: result.mcap_file || '',
+  };
+}
+
+export function buildInitialPoseSyncTaskInfo(taskInfo = {}) {
+  return {
+    initial_pose_sync: Boolean(taskInfo.initialPoseSync),
+    initial_pose_sync_duration_s: Number(
+      taskInfo.initialPoseSyncDurationS ?? 5.0
+    ),
   };
 }
 
@@ -162,13 +226,19 @@ export function useRosServiceCaller() {
           const serviceCallId = `call_service:${serviceName}:${++ros.idCounter}`;
           let settled = false;
           let serviceTimeout;
+          const handleDisconnect = () => {
+            finish(() => reject(new Error(`ROS connection closed during ${serviceName}; check inference status before retrying`)));
+          };
 
           const finish = (handler) => {
             if (settled) return;
             settled = true;
             clearTimeout(serviceTimeout);
+            ros.off('close', handleDisconnect);
+            ros.removeAllListeners(serviceCallId);
             handler();
           };
+          ros.once('close', handleDisconnect);
 
           // Set a local guard only for finite-timeout calls. Long recording
           // saves pass timeout=0 through rosbridge so the service response can
@@ -224,7 +294,11 @@ export function useRosServiceCaller() {
       // Read latest values from refs at call time so this callback's
       // identity stays stable across taskInfo / page mutations.
       const page = pageRef.current;
-      const taskInfo = page === PageType.INFERENCE
+      const isModelCommand = [
+        'switch_inference_model', 'preload_inference_model',
+        'clear_preloaded_model', 'switch_preloaded_model',
+      ].includes(command);
+      const taskInfo = isModelCommand || page === PageType.INFERENCE
         ? inferenceTaskInfoRef.current
         : recordTaskInfoRef.current;
       try {
@@ -305,15 +379,32 @@ export function useRosServiceCaller() {
           case 'cancel_segment':
             command_enum = TaskCommand.CANCEL_SEGMENT;
             break;
+          case 'prepare_next_cycle':
+            command_enum = TaskCommand.PREPARE_NEXT_CYCLE;
+            break;
+          case 'preload_inference_model':
+            command_enum = TaskCommand.PRELOAD_INFERENCE_MODEL;
+            break;
+          case 'clear_preloaded_model':
+            command_enum = TaskCommand.CLEAR_PRELOADED_MODEL;
+            break;
+          case 'switch_preloaded_model':
+            command_enum = TaskCommand.SWITCH_PRELOADED_MODEL;
+            break;
+          case 'switch_inference_model':
+            command_enum = TaskCommand.SWITCH_INFERENCE_MODEL;
+            break;
           default:
             throw new Error(`Unknown command: ${command}`);
         }
 
         let taskType = '';
 
-        if (page === PageType.RECORD) {
+        if (isModelCommand) {
+          taskType = 'inference';
+        } else if (page === PageType.RECORD) {
           taskType = 'record';
-        } else if (page === PageType.INFERENCE) {
+        } else if (page === PageType.INFERENCE || isModelCommand) {
           taskType = 'inference';
         }
 
@@ -346,31 +437,22 @@ export function useRosServiceCaller() {
           taskInstruction = [taskName];
         }
 
-        // Selection knobs (CONVERT_MP4 only) — flatten the
-        // camera-rotation dict into parallel arrays for the
-        // SendCommand.srv wire format. Selected cameras / topics /
-        // joints are not user-controlled today (the converter just
-        // uses everything from robot_config); leaving them empty
-        // makes the backend fill them in from robot_config when
-        // writing root info.json.
-        const cameraRotations = options.cameraRotations || {};
-        const cameraRotationKeys = Object.keys(cameraRotations);
-        const cameraRotationValues = cameraRotationKeys.map(
-          (k) => Number(cameraRotations[k] || 0),
-        );
-        const imageResize = options.imageResize || null;
         const inferenceMode = options.inferenceMode || taskInfo.inferenceMode || 'simulation';
-        const policyPath = String(taskInfo.policyPath || '').trim();
+        const policyPath = String(
+          isModelCommand
+            ? options.policyPath || ''
+            : taskInfo.policyPath || ''
+        ).trim();
         const accelerationMode = taskInfo.serviceType === 'groot'
           ? String(taskInfo.accelerationMode || 'pytorch').trim()
           : 'pytorch';
         const accelerationEnginePath = taskInfo.serviceType === 'groot'
           ? String(taskInfo.accelerationEnginePath || '').trim()
           : '';
-        const actionRequestMode = (
-          String(taskInfo.actionRequestMode || '').trim().toLowerCase() === 'sync'
-            ? 'sync'
-            : 'async'
+        const actionRequestMode = resolveActionRequestMode(
+          taskInfo.serviceType,
+          taskInfo.policyType,
+          taskInfo.actionRequestMode
         );
         const request = {
           task_info: {
@@ -383,7 +465,7 @@ export function useRosServiceCaller() {
             record_inference_mode: Boolean(taskInfo.recordInferenceMode),
             tags: [`inference_mode:${inferenceMode}`],
             control_hz: Number(taskInfo.controlHz || 100),
-            inference_hz: Number(taskInfo.inferenceHz || 15),
+            inference_hz: getTaskInfoInferenceHz(taskInfo),
             chunk_align_window_s: Number(
               taskInfo.chunkAlignWindowS !== '' && taskInfo.chunkAlignWindowS != null
                 ? taskInfo.chunkAlignWindowS
@@ -395,23 +477,11 @@ export function useRosServiceCaller() {
             action_request_mode: actionRequestMode,
             acceleration_mode: accelerationMode || 'pytorch',
             acceleration_engine_path: accelerationEnginePath,
+            ...buildInitialPoseSyncTaskInfo(taskInfo),
           },
           command: Number(command_enum),
           segment_index: Number(options.segmentIndex || 0),
-          // Conversion-only knobs (ignored by the orchestrator unless
-          // command == CONVERT_MP4). Default to 0 / false so the wire
-          // representation is stable for non-conversion commands.
-          conversion_fps: Number(options.conversionFps || 0),
-          convert_v21: Boolean(options.convertV21),
-          convert_v30: Boolean(options.convertV30),
-          selected_cameras: [],
-          camera_rotation_keys: cameraRotationKeys,
-          camera_rotation_values: cameraRotationValues,
-          image_resize_height: Number(imageResize?.height || 0),
-          image_resize_width: Number(imageResize?.width || 0),
-          selected_state_topics: [],
-          selected_action_topics: [],
-          selected_joints: [],
+          ...getConversionCommandRequestFields(command, options),
         };
 
         console.log('request:', request);
@@ -460,20 +530,6 @@ export function useRosServiceCaller() {
       return result;
     } catch (error) {
       console.error('Failed to get robot info:', error);
-      throw new Error(`${error.message || error}`);
-    }
-  }, [callService]);
-
-  const getTreeList = useCallback(async () => {
-    try {
-      const result = await callService(
-        '/bt/list_trees',
-        'interfaces/srv/GetTreeList',
-        {}
-      );
-      return result;
-    } catch (error) {
-      console.error('Failed to get BT tree list:', error);
       throw new Error(`${error.message || error}`);
     }
   }, [callService]);
@@ -1010,7 +1066,6 @@ export function useRosServiceCaller() {
     sendRecordCommand,
     getImageTopicList,
     getRobotInfo,
-    getTreeList,
     getNodeCatalog,
     getRobotTypeList,
     setRobotType,

@@ -19,6 +19,16 @@ uint8 UNLOAD             = 5   # Free GPU memory.
 uint8 UPDATE_INSTRUCTION = 6   # Re-condition language instruction mid-run.
                                # Requires LOAD + START already issued. Touches
                                # task_instruction only — no lifecycle change.
+# Begin a fresh episode from PAUSED while keeping model weights resident.
+# Resets policy/preprocessor/action overlap and episode tactile baselines,
+# then runs a fresh (non-continuation) Real preflight before publishing.
+uint8 RESET_CYCLE        = 7
+# Replace a compatible policy while PAUSED, preserving episode sensor state.
+# Does not resume publishing; the caller issues RESUME after acknowledgement.
+uint8 SWITCH_POLICY      = 8
+uint8 PRELOAD_POLICY     = 9   # Only before START or while PAUSED.
+uint8 CLEAR_PRELOAD      = 10
+uint8 SWITCH_PRELOADED   = 11  # PAUSED; no fallback to loading.
 
 uint8 command
 
@@ -33,8 +43,11 @@ string task_instruction
 # Safety gate. false means dry-run / 3D preview only; true permits Main runtime
 # to publish robot command topics. Default false for regenerated clients.
 bool publish_to_robot
-# Action chunk request scheduling at LOAD time. Empty / "async" preserves the
-# current prefetch behavior. "sync" requests only after the active buffer drains.
+# Action chunk request scheduling at LOAD time. Empty / "async" enables
+# latency/time alignment. "async_ordered" asynchronously prefetches near the
+# active chunk tail without alignment/skipping. "sync" preserves strict
+# response order with the general bounded look-ahead window. "sync_step"
+# waits for each selected source action to drain before the next request.
 string action_request_mode
 # Runtime acceleration selected at LOAD time. Empty / "pytorch" means normal
 # PyTorch inference. "tensorrt_dit" enables GR00T DiT-only TensorRT when
@@ -43,6 +56,15 @@ string acceleration_mode
 # Optional engine file/directory. Empty lets the backend use its model-local
 # default path.
 string acceleration_engine_path
+# Main-runtime timing configured at LOAD time. Zero values preserve the
+# policy container's environment/default settings.
+uint16 control_hz
+uint16 inference_hz
+float64 chunk_align_window_s
+# LOAD-time initial-pose synchronization settings. Ignored unless
+# publish_to_robot is true.
+bool initial_pose_sync
+float64 initial_pose_sync_duration_s
 ---
 bool success
 string message

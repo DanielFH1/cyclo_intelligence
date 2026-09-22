@@ -14,6 +14,11 @@ from typing import Any
 from engine_process.protocol import (
     CMD_GET_ACTION,
     CMD_LOAD_POLICY,
+    CMD_RESET_POLICY,
+    CMD_SWITCH_POLICY,
+    CMD_PRELOAD_POLICY,
+    CMD_CLEAR_PRELOAD,
+    CMD_SWITCH_PRELOADED,
     CMD_UNLOAD_POLICY,
     EngineCommandRequest,
     EngineCommandResponse,
@@ -39,6 +44,8 @@ class InferenceRequester:
         self._seq_id = 0
         self._lock = threading.Lock()
         self._get_action_in_flight = False
+        self._action_idle = threading.Event()
+        self._action_idle.set()
 
     def has_pending_get_action(self) -> bool:
         with self._lock:
@@ -71,6 +78,7 @@ class InferenceRequester:
                     message="get_action already in flight",
                 )
             self._get_action_in_flight = True
+            self._action_idle.clear()
             seq_id = self._next_seq_id_locked()
 
         request = EngineCommandRequest(
@@ -86,10 +94,62 @@ class InferenceRequester:
         finally:
             with self._lock:
                 self._get_action_in_flight = False
+                self._action_idle.set()
+
+    def preload_policy(self, request: Any) -> EngineCommandResponse:
+        return self._resident_policy_command(request, CMD_PRELOAD_POLICY)
+
+    def clear_preload(self, request: Any) -> EngineCommandResponse:
+        return self._resident_policy_command(request, CMD_CLEAR_PRELOAD)
+
+    def switch_preloaded_policy(self, request: Any) -> EngineCommandResponse:
+        return self._resident_policy_command(request, CMD_SWITCH_PRELOADED)
+
+    def switch_policy(self, request: Any) -> EngineCommandResponse:
+        return self._resident_policy_command(request, CMD_SWITCH_POLICY)
+
+    def _resident_policy_command(self, request: Any, command: int) -> EngineCommandResponse:
+        # PAUSE has stopped new requests. Drain the last caller before using
+        # the shared service client for the long-running weight replacement.
+        if not self._action_idle.wait(timeout=self._get_action_timeout_s):
+            return EngineCommandResponse(
+                success=False,
+                message="Action request still in flight; retry switching after it completes",
+            )
+        return self._call(
+            EngineCommandRequest(
+                command=command,
+                seq_id=self._next_seq_id(),
+                model_path=str(getattr(request, "model_path", "") or ""),
+                robot_type=str(getattr(request, "robot_type", "") or ""),
+            ),
+            self._load_policy_timeout_s,
+        )
 
     def unload_policy(self, timeout_s: float | None = None) -> EngineCommandResponse:
         seq_id = self._next_seq_id()
         request = EngineCommandRequest(command=CMD_UNLOAD_POLICY, seq_id=seq_id)
+        return self._call(
+            request,
+            self._load_policy_timeout_s if timeout_s is None else timeout_s,
+        )
+
+    def reset_policy_cycle(
+        self,
+        timeout_s: float | None = None,
+    ) -> EngineCommandResponse:
+        """Reset one episode's runtime state while retaining model weights."""
+        with self._lock:
+            if self._get_action_in_flight:
+                return EngineCommandResponse(
+                    success=False,
+                    message=(
+                        "cannot reset cycle while an action request is still in flight; "
+                        "wait briefly and retry"
+                    ),
+                )
+            seq_id = self._next_seq_id_locked()
+        request = EngineCommandRequest(command=CMD_RESET_POLICY, seq_id=seq_id)
         return self._call(
             request,
             self._load_policy_timeout_s if timeout_s is None else timeout_s,

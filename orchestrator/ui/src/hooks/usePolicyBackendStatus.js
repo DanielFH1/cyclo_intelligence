@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 
 const API_BASE = '/api';
 const DEFAULT_POLL_MS = 2000;
-export const BACKEND_WARMUP_MIN_UPTIME_S = 45;
 
 export const POLICY_BACKEND_SERVICE_LABELS = {
   'main-runtime': 'Main',
@@ -16,9 +15,11 @@ const POLICY_BACKEND_SERVICE_GROUPS = [
   ['inference-server', 'control-publisher'],
 ];
 
-export const getPolicyBackendName = (serviceType) => (
-  serviceType === 'groot' ? 'groot' : 'lerobot'
-);
+export const getPolicyBackendName = (serviceType) => {
+  if (serviceType === 'groot') return 'groot';
+  if (serviceType === 'vitacformer') return 'vitacformer';
+  return 'lerobot';
+};
 
 export function getPolicyBackendServiceLabel(name) {
   return POLICY_BACKEND_SERVICE_LABELS[name] || name;
@@ -73,8 +74,7 @@ async function readJsonResponse(response) {
   }
 }
 
-export function getPolicyBackendReadiness(status, options = {}) {
-  const minMainUptimeS = options.minMainUptimeS ?? BACKEND_WARMUP_MIN_UPTIME_S;
+export function getPolicyBackendReadiness(status) {
   if (!status) {
     return {
       ready: false,
@@ -117,17 +117,6 @@ export function getPolicyBackendReadiness(status, options = {}) {
       ready: false,
       state: 'warming',
       message: 'Backend processes are starting...',
-    };
-  }
-
-  const main = services[0];
-  const mainUptime = Number(main.uptime_s || 0);
-  if (mainUptime < minMainUptimeS) {
-    const waitS = Math.max(1, Math.ceil(minMainUptimeS - mainUptime));
-    return {
-      ready: false,
-      state: 'warming',
-      message: `Backend warming up... ${waitS}s`,
     };
   }
 

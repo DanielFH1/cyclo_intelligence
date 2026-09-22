@@ -39,6 +39,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetUserList.srv"
   "srv/LoadAndRunTree.srv"
   "srv/RecordingCommand.srv"
+  "srv/RecordingCameras.srv"
   "srv/SendCommand.srv"
   "srv/SendTrainingCommand.srv"
   "srv/SetHFUser.srv"

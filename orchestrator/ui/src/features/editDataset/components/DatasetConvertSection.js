@@ -63,6 +63,9 @@ export default function DatasetConvertSection({ isEditable = true }) {
   const [conversionFps, setConversionFps] = useState(15);
   const [convertV21, setConvertV21] = useState(true);
   const [convertV30, setConvertV30] = useState(true);
+  const [tactileEnabled, setTactileEnabled] = useState(false);
+  const [tactileMode, setTactileMode] = useState('state_mean');
+  const [tactileBaselineSamples, setTactileBaselineSamples] = useState(20);
 
   // ----- isConverting tracks the backend status -------------------------
   // Driven by /data/status (DataOperationStatus, OP_CONVERSION) routed
@@ -130,6 +133,8 @@ export default function DatasetConvertSection({ isEditable = true }) {
           convertV30,
           cameraRotations: {},
           imageResize: null,
+          tactileMode: tactileEnabled ? tactileMode : 'off',
+          tactileBaselineSamples,
         });
         if (!result?.success) {
           setConvertError(result?.message || 'Conversion failed');
@@ -149,6 +154,9 @@ export default function DatasetConvertSection({ isEditable = true }) {
     conversionFps,
     convertV21,
     convertV30,
+    tactileEnabled,
+    tactileMode,
+    tactileBaselineSamples,
   ]);
 
   // ----- file browser callbacks ------------------------------------------
@@ -282,6 +290,56 @@ export default function DatasetConvertSection({ isEditable = true }) {
               <span className="text-xs text-red-500">
                 Pick at least one format.
               </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 cursor-pointer text-sm">
+              <input
+                type="checkbox"
+                checked={tactileEnabled}
+                onChange={(e) => setTactileEnabled(e.target.checked)}
+                disabled={isConverting || !isEditable}
+                className="rounded"
+              />
+              <span>Tactile features</span>
+            </label>
+            {tactileEnabled && (
+              <>
+                <select
+                  value={tactileMode}
+                  onChange={(e) => setTactileMode(e.target.value)}
+                  disabled={isConverting || !isEditable}
+                  className={clsx(
+                    'text-sm p-1.5 border border-gray-300 rounded-md',
+                    'focus:outline-none focus:ring-2 focus:ring-blue-500',
+                    (isConverting || !isEditable) && 'bg-gray-100 cursor-not-allowed'
+                  )}
+                >
+                  <option value="state_mean">State means</option>
+                  <option value="separate_raw">Separate raw</option>
+                </select>
+                <span className="text-sm text-gray-600 font-medium whitespace-nowrap">
+                  Baseline samples
+                </span>
+                <input
+                  type="number"
+                  min={1}
+                  max={512}
+                  step={1}
+                  value={tactileBaselineSamples}
+                  onChange={(e) => {
+                    const next = parseInt(e.target.value, 10);
+                    if (Number.isFinite(next)) setTactileBaselineSamples(next);
+                  }}
+                  disabled={isConverting || !isEditable}
+                  className={clsx(
+                    'text-sm w-24 p-1.5 border border-gray-300 rounded-md',
+                    'focus:outline-none focus:ring-2 focus:ring-blue-500',
+                    (isConverting || !isEditable) && 'bg-gray-100 cursor-not-allowed'
+                  )}
+                />
+              </>
             )}
           </div>
 

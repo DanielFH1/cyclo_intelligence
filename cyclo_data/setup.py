@@ -35,7 +35,7 @@ packages = [
 
 setup(
     name=package_name,
-    version='1.3.0',
+    version='1.4.0',
     packages=packages,
     # Nested layout convention (D17): root namespace '' maps to current
     # directory. Avoids colcon-core's _symlinks_in_build veto on
@@ -72,6 +72,7 @@ setup(
     entry_points={
         'console_scripts': [
             'cyclo_data_node = cyclo_data.cyclo_data_node:main',
+            'camera_preview_node = cyclo_data.camera_preview_node:main',
             # CLI tools relocated from orchestrator/scripts/ in Step 7.
             # D9 (§10.3): 'visualize_rosbag' was on orchestrator/setup.py
             # before Step 3 Part A and lost its entry — re-registered here

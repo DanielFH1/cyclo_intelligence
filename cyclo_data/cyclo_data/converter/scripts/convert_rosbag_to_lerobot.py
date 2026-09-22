@@ -298,6 +298,42 @@ Examples:
         default=1000,
         help="Maximum episodes per chunk (default: 1000)",
     )
+    parser.add_argument(
+        "--selected-state-topic",
+        action="append",
+        default=[],
+        help="State topic to retain; repeat for multiple topics.",
+    )
+    parser.add_argument(
+        "--selected-action-topic",
+        action="append",
+        default=[],
+        help="Action topic to retain; repeat for multiple topics.",
+    )
+    parser.add_argument(
+        "--selected-joint",
+        action="append",
+        default=[],
+        help="Joint to retain in the exact requested order; repeat per joint.",
+    )
+    parser.add_argument(
+        "--tactile-mode",
+        choices=["off", "state_mean", "separate_raw"],
+        default="off",
+        help="Disable tactile features, store finger means, or store lossless tactile features.",
+    )
+    parser.add_argument(
+        "--selected-tactile-topic",
+        action="append",
+        default=[],
+        help="Tactile topic to retain; repeat for multiple topics.",
+    )
+    parser.add_argument(
+        "--tactile-baseline-samples",
+        type=int,
+        default=20,
+        help="Messages used for each episode's per-taxel median baseline.",
+    )
 
     # v3.0 specific options
     parser.add_argument(
@@ -430,6 +466,12 @@ Examples:
             apply_exclude_regions=not args.no_exclude,
             data_file_size_in_mb=args.data_file_size,
             video_file_size_in_mb=args.video_file_size,
+            selected_state_topics=args.selected_state_topic,
+            selected_action_topics=args.selected_action_topic,
+            selected_joints=args.selected_joint,
+            tactile_mode=args.tactile_mode,
+            selected_tactile_topics=args.selected_tactile_topic,
+            tactile_baseline_samples=args.tactile_baseline_samples,
         )
         converter = RosbagToLerobotV30Converter(config, logger)
     else:
@@ -447,6 +489,12 @@ Examples:
             chunks_size=args.chunks_size,
             apply_trim=not args.no_trim,
             apply_exclude_regions=not args.no_exclude,
+            selected_state_topics=args.selected_state_topic,
+            selected_action_topics=args.selected_action_topic,
+            selected_joints=args.selected_joint,
+            tactile_mode=args.tactile_mode,
+            selected_tactile_topics=args.selected_tactile_topic,
+            tactile_baseline_samples=args.tactile_baseline_samples,
         )
         converter = RosbagToLerobotConverter(config, logger)
 

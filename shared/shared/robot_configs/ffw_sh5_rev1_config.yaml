@@ -28,8 +28,8 @@ orchestrator:
             topic: /zed/zed_node/right/image_rect_color/compressed
             msg_type: sensor_msgs/msg/CompressedImage
 
-        # Raw tactile observations are recorded to MCAP, but not flattened
-        # into observation.state until the converter has a HandPressures parser.
+        # Raw tactile observations are recorded to MCAP. Converters include
+        # tactile-derived features only when an explicit tactile mode is set.
         tactile:
           left_hand_pressure:
             topic: /left_hand/finger_pressures
@@ -197,7 +197,6 @@ orchestrator:
             - linear_x
             - linear_y
             - angular_z
-
       recording:
         extra_topics:
           - /tf

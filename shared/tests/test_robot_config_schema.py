@@ -73,16 +73,22 @@ def test_sh5_config_records_raw_tactile_topics():
 
 def test_sh5_state_and_action_dimensions_match_layout():
     section = robot_schema.load_robot_section("ffw_sh5_rev1")
+    state_groups = robot_schema.get_state_groups(section)
+    action_groups = robot_schema.get_action_groups(section)
 
     state_dim = sum(
         len(cfg["joint_names"])
-        for cfg in robot_schema.get_state_groups(section).values()
+        for cfg in state_groups.values()
     )
     action_dim = sum(
         len(cfg["joint_names"])
-        for cfg in robot_schema.get_action_groups(section).values()
+        for cfg in action_groups.values()
     )
 
+    assert set(state_groups) >= {"upper_body", "mobile"}
+    assert set(action_groups) >= {"head", "lift", "mobile"}
+    assert state_groups["upper_body"]["topic"] == "/joint_states"
+    assert state_groups["mobile"]["topic"] == "/odom"
     assert state_dim == 60
     assert action_dim == 60
 

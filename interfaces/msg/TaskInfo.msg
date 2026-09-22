@@ -28,8 +28,10 @@ string service_type
 # container Main runtime to publish robot command topics.
 string inference_mode
 
-# Action chunk request scheduling. "async" requests the next chunk while the
-# current buffer is still executing. "sync" waits until the buffer is empty.
+# Action chunk request scheduling. "async" uses latency/L2 alignment,
+# "async_ordered" prefetches near the tail and preserves full source order,
+# "sync" uses ordered refill with the general look-ahead window, and
+# "sync_step" waits for each selected action to drain before the next request.
 string action_request_mode
 
 # Policy acceleration mode. Empty and "pytorch" mean the normal model path.
@@ -39,3 +41,8 @@ string acceleration_mode
 # Optional TensorRT engine file/directory. Empty lets the backend pick the
 # model-local default, e.g. <model_path>/dit_model_bf16.trt for GR00T DiT-only.
 string acceleration_engine_path
+
+# Real-robot startup safety option. When enabled, inference uses the first
+# action of the first chunk as a slow initial pose target before normal control.
+bool initial_pose_sync
+float64 initial_pose_sync_duration_s

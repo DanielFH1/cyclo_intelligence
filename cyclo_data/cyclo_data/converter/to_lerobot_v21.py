@@ -1509,6 +1509,13 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                 'selected_state_topics': list(self.config.selected_state_topics),
                 'selected_action_topics': list(self.config.selected_action_topics),
                 'selected_joints': list(self.config.selected_joints),
+                'tactile_mode': self.config.tactile_mode,
+                'selected_tactile_topics': list(
+                    self.config.selected_tactile_topics
+                ),
+                'tactile_baseline_samples': int(
+                    self.config.tactile_baseline_samples
+                ),
                 'source_rosbags': list(self.config.source_rosbags),
             }
 
@@ -1660,10 +1667,20 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         common.update(
             {
                 "timestamps": self._array_cache_signature(episode.timestamps),
-                "observation_state": self._array_cache_signature(
-                    episode.observation_state
-                ),
-                "action": self._array_cache_signature(episode.action),
+            "observation_state": self._array_cache_signature(
+                episode.observation_state
+            ),
+            "action": self._array_cache_signature(episode.action),
+            "tactile": {
+                side: self._array_cache_signature(values)
+                for side, values in sorted(episode.tactile.items())
+            },
+            "tactile_baseline": {
+                side: self._array_cache_signature(values)
+                for side, values in sorted(
+                    episode.tactile_baseline.items()
+                )
+            },
                 "subtask_indices": self._array_cache_signature(
                     episode.subtask_indices
                 ),
@@ -2084,6 +2101,13 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             len(episode.observation_state[0]) if episode.observation_state else 0
         )
         action_dim = len(episode.action[0]) if episode.action else 0
+        tactile_sides = sorted(
+            side for side, values in episode.tactile.items() if values
+        )
+        tactile_dims = {
+            side: int(np.asarray(episode.tactile[side][0]).size)
+            for side in tactile_sides
+        }
 
         # Build schema with fixed_size_list for HuggingFace compatibility
         schema_fields = [
@@ -2097,6 +2121,20 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         if state_dim > 0:
             schema_fields.append(
                 pa.field("observation.state", pa.list_(pa.float32(), state_dim))
+            )
+        for side in tactile_sides:
+            width = tactile_dims[side]
+            schema_fields.extend(
+                [
+                    pa.field(
+                        f"observation.tactile.{side}",
+                        pa.list_(pa.float32(), width),
+                    ),
+                    pa.field(
+                        f"observation.tactile_baseline.{side}",
+                        pa.list_(pa.float32(), width),
+                    ),
+                ]
             )
         has_subtask_feature = "subtask_index" in self._features
         if has_subtask_feature:
@@ -2140,6 +2178,23 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
             arrays.append(
                 pa.array(state_values, type=pa.list_(pa.float32(), state_dim))
             )
+        for side in tactile_sides:
+            width = tactile_dims[side]
+            raw = np.asarray(
+                episode.tactile[side], dtype=np.float32
+            ).reshape(num_frames, width)
+            baseline = np.asarray(
+                episode.tactile_baseline[side], dtype=np.float32
+            ).reshape(num_frames, width)
+            arrays.extend(
+                [
+                    pa.array(raw.tolist(), type=pa.list_(pa.float32(), width)),
+                    pa.array(
+                        baseline.tolist(),
+                        type=pa.list_(pa.float32(), width),
+                    ),
+                ]
+            )
 
         if has_subtask_feature:
             if len(episode.subtask_indices) == num_frames:
@@ -2168,6 +2223,16 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
                 "length": state_dim,
                 "_type": "Sequence",
             }
+        for side, width in sorted(tactile_dims.items()):
+            for prefix in (
+                "observation.tactile",
+                "observation.tactile_baseline",
+            ):
+                hf_features[f"{prefix}.{side}"] = {
+                    "feature": {"dtype": "float32", "_type": "Value"},
+                    "length": width,
+                    "_type": "Sequence",
+                }
         if has_subtask_feature:
             hf_features["subtask_index"] = {"dtype": "int64", "_type": "Value"}
 
@@ -2188,6 +2253,11 @@ class RosbagToLerobotConverter(RosbagToLerobotConverterBase):
         ordered = {}
         for key in ("observation.state", "action"):
             if key in self._features:
+                ordered[key] = self._features[key]
+        for key in self._features:
+            if key.startswith("observation.tactile.") or key.startswith(
+                "observation.tactile_baseline."
+            ):
                 ordered[key] = self._features[key]
         for key in self._features:
             if key.startswith("observation.images."):

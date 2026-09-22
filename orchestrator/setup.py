@@ -1,4 +1,5 @@
 from glob import glob
+from pathlib import Path
 
 from setuptools import setup
 
@@ -49,10 +50,9 @@ packages = [
     f'{package_name}.timer',
     f'{package_name}.training',
 ]
-
 setup(
     name=package_name,
-    version='1.3.0',
+    version='1.4.0',
     packages=packages,
     # Nested layout convention (D17): root namespace '' maps to current
     # directory. Avoids colcon-core's _symlinks_in_build veto on
@@ -77,7 +77,10 @@ setup(
         ),
         (
             'share/' + package_name + '/bt/templates',
-            glob(f'{package_name}/bt/templates/*'),
+            [
+                path for path in glob(f'{package_name}/bt/templates/*')
+                if Path(path).is_file()
+            ],
         ),
     ],
     install_requires=[

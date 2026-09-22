@@ -14,12 +14,18 @@ import {
   selectInferenceTaskInfo,
   setInferenceTaskInfo,
 } from '../features/tasks/taskSlice';
+import {
+  defaultInferenceHz,
+  resolveActionRequestMode,
+} from '../constants/policyCapabilities';
 
 // Inference models. Each option pairs a backend (orchestrator routing
 // via TaskInfo.service_type) with a policy class (drives instruction
-// visibility and future per-model UI knobs). LeRobot is the backend;
+// visibility and future per-model UI knobs). LeRobot is one backend;
 // ACT, SmolVLA, XVLA, Pi0, Pi0.5, and Diffusion are policy families that
 // can be loaded by that backend when the selected checkpoint is compatible.
+// ViTacFormer is intentionally isolated because its runtime and image contract
+// differ from the general LeRobot backend.
 //
 // Add an enabled entry once a policy is validated end-to-end. value is the
 // composite key the dropdown stores; serviceType / policyType are the
@@ -32,13 +38,21 @@ const MODEL_GROUPS = [
     options: [
       { value: 'lerobot:act', label: 'ACT', serviceType: 'lerobot', policyType: 'act' },
       { value: 'lerobot:diffusion', label: 'Diffusion', serviceType: 'lerobot', policyType: 'diffusion' },
+      { value: 'lerobot:tactile_act', label: 'Tactile ACT', serviceType: 'lerobot', policyType: 'tactile_act' },
       { value: 'lerobot:smolvla', label: 'SmolVLA', serviceType: 'lerobot', policyType: 'smolvla' },
       { value: 'lerobot:xvla', label: 'XVLA', serviceType: 'lerobot', policyType: 'xvla' },
       { value: 'lerobot:pi0', label: 'Pi0', serviceType: 'lerobot', policyType: 'pi0' },
       { value: 'lerobot:pi05', label: 'Pi0.5', serviceType: 'lerobot', policyType: 'pi05' },
       { value: 'lerobot:molmoact2', label: 'MolmoAct2', serviceType: 'lerobot', policyType: 'molmoact2' },
       { value: 'lerobot:vla_jepa', label: 'VLA-JEPA', serviceType: 'lerobot', policyType: 'vla_jepa' },
+      { value: 'lerobot:trex', label: 'T-Rex', serviceType: 'lerobot', policyType: 'trex' },
       { value: 'lerobot:fastwam', label: 'FastWAM', serviceType: 'lerobot', policyType: 'fastwam' },
+    ],
+  },
+  {
+    label: 'ViTacFormer',
+    options: [
+      { value: 'vitacformer:vitacformer', label: 'ViTacFormer', serviceType: 'vitacformer', policyType: 'vitacformer' },
     ],
   },
   {
@@ -97,6 +111,12 @@ const InferenceModelSelector = ({ readonly = false }) => {
       setInferenceTaskInfo({
         serviceType: sel.serviceType,
         policyType: sel.policyType,
+        inferenceHz: defaultInferenceHz(sel.serviceType, sel.policyType),
+        actionRequestMode: resolveActionRequestMode(
+          sel.serviceType,
+          sel.policyType,
+          'async'
+        ),
         accelerationMode: sel.serviceType === 'groot'
           ? (info.accelerationMode || 'pytorch')
           : 'pytorch',

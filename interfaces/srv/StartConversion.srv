@@ -67,6 +67,14 @@ string[] selected_action_topics
 # Joint subset / order that ends up in observation.state and action.
 # Empty = full robot_config joint_order.
 string[] selected_joints
+
+# Tactile storage contract. Empty or "off" preserves the A state/action
+# contract. "state_mean" appends per-finger means to observation.state.
+# "separate_raw" stores lossless taxels and an episode-local baseline in
+# dedicated observation features.
+string tactile_mode
+string[] selected_tactile_topics
+uint16 tactile_baseline_samples
 ---
 bool success
 # Async job identifier — poll via GetConversionStatus.srv.

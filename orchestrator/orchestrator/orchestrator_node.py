@@ -19,6 +19,7 @@
 from datetime import datetime
 import glob
 import json
+import math
 import os
 from pathlib import Path
 import threading
@@ -55,6 +56,12 @@ from interfaces.srv import (
 )
 
 from orchestrator.internal.communication.communicator import Communicator
+from orchestrator.internal.communication.joystick_controls import (
+    ARM_TOGGLE_TRIGGERS,
+    RECORD_CANCEL_ACTION,
+    RECORD_TOGGLE_ACTION,
+    get_joystick_recording_action,
+)
 from orchestrator.internal.communication.cyclo_data_client import CycloDataClient
 # DataManager is imported only for its whoami_huggingface @staticmethod
 # used by set_hf_user / get_hf_user callbacks. Session-state ownership
@@ -68,7 +75,19 @@ from orchestrator.internal.communication.container_service_client import (
     ContainerServiceClient,
 )
 from orchestrator.internal.communication.inference_mode import (
+    inference_runtime_signature,
+    inference_timing_from_task_info,
     publish_to_robot_from_task_info,
+    publish_to_robot_override_from_task_info,
+)
+from orchestrator.internal.communication.model_switch import (
+    SWITCH_INFERENCE_MODEL_COMMAND,
+    PRELOAD_INFERENCE_MODEL_COMMAND,
+    CLEAR_PRELOADED_MODEL_COMMAND,
+    SWITCH_PRELOADED_MODEL_COMMAND,
+    intercept_model_switch_command,
+    prepare_inference_model,
+    switch_inference_model,
 )
 from orchestrator.timer.timer_manager import TimerManager
 from orchestrator.training.zenoh_training_manager import ZenohTrainingManager
@@ -87,6 +106,16 @@ def _env_int(name, default):
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return int(default)
+
+
+# Adding a constant to SendCommand.srv does not change its wire layout, but a
+# running container may still have generated Python bindings from the previous
+# interface build. Keep numeric compatibility until that image is rebuilt.
+PREPARE_NEXT_CYCLE_COMMAND = getattr(
+    SendCommand.Request,
+    'PREPARE_NEXT_CYCLE',
+    25,
+)
 
 
 class OrchestratorNode(Node):
@@ -145,7 +174,10 @@ class OrchestratorNode(Node):
         self._recording_command_lock = threading.Lock()
         # LOAD/START and STOP/UNLOAD must not cross in flight. The UI can send
         # Clear then Start faster than the policy container can release CUDA.
-        self._inference_lifecycle_lock = threading.Lock()
+        self._inference_lifecycle_lock = threading.RLock()
+        self._model_switch_operation = None
+        self._model_switch_needs_retry = False
+        self._inference_phase = InferenceStatus.READY
 
         self.params = None
         self.robot_section = None
@@ -201,6 +233,18 @@ class OrchestratorNode(Node):
         self._loaded_inference_acceleration_mode: str = 'pytorch'
         self._loaded_inference_acceleration_engine_path: str = ''
         self._loaded_inference_action_request_mode: str = 'async'
+        self._loaded_inference_control_hz: int = 100
+        self._loaded_inference_inference_hz: int = 15
+        self._loaded_inference_chunk_align_window_s: float = 0.3
+        self._loaded_inference_initial_pose_sync: bool = False
+        self._loaded_inference_initial_pose_sync_duration_s: float = 5.0
+        self._initial_pose_sync_status_timer: Optional[threading.Timer] = None
+        self._initial_pose_sync_status_generation: int = 0
+        self._initial_pose_sync_hold_pending: bool = False
+        # True only after PREPARE_NEXT_CYCLE has paused policy publishing and
+        # requested the bringup-owned task initial pose. The next Start uses a
+        # fresh episode reset rather than continuation Resume.
+        self._inference_cycle_prepared: bool = False
 
         # HF endpoint registry — orchestrator-owned because the
         # set/get/list/select_hf_endpoint services also read and mutate
@@ -400,6 +444,8 @@ class OrchestratorNode(Node):
             'action_request_mode',
             'acceleration_mode',
             'acceleration_engine_path',
+            'initial_pose_sync',
+            'initial_pose_sync_duration_s',
         ):
             value = getattr(task_info, field_name)
             if isinstance(value, list):
@@ -643,11 +689,9 @@ class OrchestratorNode(Node):
         # The rest of this function still drives inference-side config
         # (control_hz, joint_order, params) which stays on this node.
 
-        control_hz = getattr(task_info, 'control_hz', 0) or 100
-        inference_hz = getattr(task_info, 'inference_hz', 0) or 15
-        chunk_align_window_s = getattr(task_info, 'chunk_align_window_s', 0.0)
-        if chunk_align_window_s <= 0.0:
-            chunk_align_window_s = 0.3
+        control_hz, inference_hz, chunk_align_window_s = (
+            inference_timing_from_task_info(task_info)
+        )
         self._control_hz = control_hz
         self._inference_hz = inference_hz
         self._chunk_align_window_s = chunk_align_window_s
@@ -669,7 +713,10 @@ class OrchestratorNode(Node):
                 callback_function=callback,
             )
         self.get_logger().info(
-            f'Robot control parameters initialized (control_hz={control_hz})')
+            'Robot control parameters initialized '
+            f'(control_hz={control_hz} inference_hz={inference_hz} '
+            f'chunk_align_window_s={chunk_align_window_s})'
+        )
 
     def clear_parameters(self):
         if self.timer_manager is not None:
@@ -884,9 +931,10 @@ class OrchestratorNode(Node):
         """Publish a one-shot InferenceStatus on /task/inference_status.
 
         The container owns the 100 Hz control loop (§5.5); orchestrator
-        only signals LOADING / INFERENCING / PAUSED / READY on commands.
+        only signals LOADING / SYNCING / INFERENCING / PAUSED / READY on commands.
         Record-side phase lives on /data/recording/status (D18).
         """
+        self._inference_phase = phase
         if self.communicator is None:
             return
         robot_type = getattr(self, 'robot_type', '') or ''
@@ -895,6 +943,142 @@ class OrchestratorNode(Node):
             robot_type=robot_type,
             error=error,
         )
+
+    def _begin_initial_pose_sync_status(
+        self,
+        client: ContainerServiceClient,
+        duration_s: float,
+    ) -> None:
+        with self._state_lock:
+            if self.container_service_client is not client:
+                return
+            previous_timer = self._initial_pose_sync_status_timer
+            self._initial_pose_sync_hold_pending = False
+            self._initial_pose_sync_status_generation += 1
+            generation = self._initial_pose_sync_status_generation
+
+            def _complete_sync_status():
+                with self._state_lock:
+                    if (
+                        generation != self._initial_pose_sync_status_generation
+                        or self.container_service_client is not client
+                    ):
+                        return
+                    self._initial_pose_sync_status_timer = None
+                    self._initial_pose_sync_hold_pending = False
+                self._publish_inference_phase(InferenceStatus.INFERENCING)
+
+            timer = threading.Timer(float(duration_s), _complete_sync_status)
+            timer.daemon = True
+            self._initial_pose_sync_status_timer = timer
+        if previous_timer is not None:
+            previous_timer.cancel()
+        self._publish_inference_phase(InferenceStatus.SYNCING)
+        timer.start()
+
+    def _cancel_initial_pose_sync_status(
+        self,
+        expected_client: Optional[ContainerServiceClient] = None,
+    ) -> bool:
+        with self._state_lock:
+            if (
+                expected_client is not None
+                and self.container_service_client is not expected_client
+            ):
+                return False
+            timer = self._initial_pose_sync_status_timer
+            self._initial_pose_sync_status_timer = None
+            self._initial_pose_sync_status_generation += 1
+        if timer is not None:
+            timer.cancel()
+            return True
+        return False
+
+    def _initial_pose_sync_is_active(
+        self,
+        client: ContainerServiceClient,
+    ) -> bool:
+        with self._state_lock:
+            return (
+                self.container_service_client is client
+                and (
+                    self._initial_pose_sync_status_timer is not None
+                    or self._initial_pose_sync_hold_pending
+                )
+            )
+
+    def _mark_initial_pose_sync_hold_failed(
+        self,
+        client: ContainerServiceClient,
+        message: str,
+    ) -> None:
+        with self._state_lock:
+            if self.container_service_client is not client:
+                return
+            self._initial_pose_sync_hold_pending = True
+        self._publish_inference_phase(InferenceStatus.SYNCING, error=message)
+
+    def _clear_initial_pose_sync_hold_pending(
+        self,
+        client: ContainerServiceClient,
+    ) -> None:
+        with self._state_lock:
+            if self.container_service_client is client:
+                self._initial_pose_sync_hold_pending = False
+
+    def _pause_inference_client(
+        self,
+        client: ContainerServiceClient,
+    ):
+        sync_was_active = self._initial_pose_sync_is_active(client)
+        if sync_was_active:
+            self._cancel_initial_pose_sync_status(expected_client=client)
+        try:
+            result = client.inference_command(ContainerServiceClient.CMD_PAUSE)
+        except Exception as exc:
+            if sync_was_active:
+                self._mark_initial_pose_sync_hold_failed(client, str(exc))
+            raise
+        if result.success:
+            self._clear_initial_pose_sync_hold_pending(client)
+        elif sync_was_active:
+            self._mark_initial_pose_sync_hold_failed(
+                client,
+                result.message or 'Current-pose hold failed',
+            )
+        return result
+
+    def _stop_initial_pose_sync_for_teardown(
+        self,
+        client: ContainerServiceClient,
+        force: bool = False,
+    ) -> bool:
+        sync_is_active = self._initial_pose_sync_is_active(client)
+        if not sync_is_active and not force:
+            return False
+        if sync_is_active:
+            self._cancel_initial_pose_sync_status(expected_client=client)
+        try:
+            stop_result = client.inference_command(ContainerServiceClient.CMD_STOP)
+        except Exception as exc:
+            message = f'Current-pose hold failed: {exc}'
+            self._mark_initial_pose_sync_hold_failed(client, message)
+            raise RuntimeError(message) from exc
+        if not stop_result.success:
+            message = stop_result.message or 'Current-pose hold failed; retry'
+            self._mark_initial_pose_sync_hold_failed(client, message)
+            raise RuntimeError(message)
+        self._clear_initial_pose_sync_hold_pending(client)
+        return True
+
+    def _prepare_active_initial_pose_sync_teardown(
+        self,
+    ) -> Optional[ContainerServiceClient]:
+        with self._state_lock:
+            client = self.container_service_client
+        if client is not None and self._stop_initial_pose_sync_for_teardown(client):
+            return client
+        return None
 
     def user_training_interaction_callback(self, request, response):
         """
@@ -1087,6 +1271,23 @@ class OrchestratorNode(Node):
             self.training_timer.stop('training_status')
 
     def user_interaction_callback(self, request, response):
+        intercepted = intercept_model_switch_command(self, request, response)
+        if intercepted is not None:
+            return intercepted
+        # Keep Home's PAUSE + request marker atomic with Start/Resume/Stop.
+        # In particular, a concurrent Start must not observe the old marker
+        # while a newly requested physical home is in progress.
+        if request.command in {
+            SendCommand.Request.START_INFERENCE,
+            SendCommand.Request.RESUME_INFERENCE,
+            SendCommand.Request.STOP_INFERENCE,
+            PREPARE_NEXT_CYCLE_COMMAND,
+        }:
+            with self._inference_lifecycle_lock:
+                return self._user_interaction_callback(request, response)
+        return self._user_interaction_callback(request, response)
+
+    def _user_interaction_callback(self, request, response):
         """
         Handle user commands for recording control (simplified mode).
 
@@ -1096,6 +1297,30 @@ class OrchestratorNode(Node):
         - RERECORD: Cancel current recording (discard)
         """
         try:
+            intercepted = intercept_model_switch_command(self, request, response)
+            if intercepted is not None:
+                return intercepted
+            if request.command in {
+                SendCommand.Request.START_INFERENCE,
+                SendCommand.Request.RESUME_INFERENCE,
+            }:
+                with self._state_lock:
+                    cycle_pending = self._inference_cycle_prepared
+                if cycle_pending:
+                    communicator = self.communicator
+                    if communicator is None:
+                        response.success = False
+                        response.message = 'Cycle Home completion cannot be checked: robot communicator is unavailable'
+                        return response
+                    ready, message = communicator.initial_pose_return_ready()
+                    if not ready:
+                        response.success = False
+                        response.message = message
+                        return response
+            if request.command in {PRELOAD_INFERENCE_MODEL_COMMAND, CLEAR_PRELOADED_MODEL_COMMAND}:
+                return prepare_inference_model(self, request, response)
+            if request.command in {SWITCH_INFERENCE_MODEL_COMMAND, SWITCH_PRELOADED_MODEL_COMMAND}:
+                return switch_inference_model(self, request, response)
             if request.command == SendCommand.Request.REFRESH_TOPICS:
                 # Forward to cyclo_data /data/recording with the topic
                 # inventory from our Communicator (Part C2d-4).
@@ -1309,6 +1534,18 @@ class OrchestratorNode(Node):
 
             elif request.command == SendCommand.Request.START_INFERENCE:
                 task_info = request.task_info
+                try:
+                    requested_publish_to_robot = (
+                        publish_to_robot_override_from_task_info(task_info)
+                    )
+                except ValueError as exc:
+                    response.success = False
+                    response.message = str(exc)
+                    return response
+                # A brand-new inference session has no loaded mode to inherit.
+                # Only an explicit Robot request may enable robot publishing;
+                # absent legacy mode metadata defaults safely to Simulation.
+                publish_to_robot = bool(requested_publish_to_robot)
                 self._cache_ui_task_info(task_info, 'START_INFERENCE')
 
                 task_instruction = (
@@ -1316,7 +1553,6 @@ class OrchestratorNode(Node):
                     if task_info.task_instruction
                     else ''
                 )
-                publish_to_robot = publish_to_robot_from_task_info(task_info)
                 service_prefix = self._determine_service_prefix(task_info)
                 requested_acceleration_mode, requested_acceleration_engine_path = (
                     self._acceleration_from_task_info(task_info)
@@ -1324,6 +1560,15 @@ class OrchestratorNode(Node):
                 requested_action_request_mode = (
                     self._action_request_mode_from_task_info(task_info)
                 )
+                (
+                    requested_control_hz,
+                    requested_inference_hz,
+                    requested_chunk_align_window_s,
+                ) = inference_timing_from_task_info(task_info)
+                (
+                    requested_initial_pose_sync,
+                    requested_initial_pose_sync_duration_s,
+                ) = self._initial_pose_sync_from_task_info(task_info)
 
                 # If the requested policy is already loaded on this
                 # container, treat START_INFERENCE as RESUME. If the user
@@ -1332,9 +1577,10 @@ class OrchestratorNode(Node):
                 #
                 # The policy container may have been restarted outside
                 # orchestrator, though; in that case the cached client is
-                # stale and the container replies with "not running" or
-                # "LOAD first". Fall back to a fresh LOAD -> START instead
-                # of surfacing that confusing error.
+                # stale and the container either rejects RESUME because no
+                # policy is loaded or its cached ROS client can no longer
+                # discover/reach the service. Fall back to a fresh
+                # LOAD -> START instead of surfacing that confusing error.
                 # Snapshot the client so a concurrent _teardown_inference_client
                 # cannot null it between the prefix check and the call.
                 requested_policy_path = self._normalize_policy_path(
@@ -1352,22 +1598,45 @@ class OrchestratorNode(Node):
                     loaded_action_request_mode = (
                         self._loaded_inference_action_request_mode
                     )
+                    loaded_control_hz = self._loaded_inference_control_hz
+                    loaded_inference_hz = self._loaded_inference_inference_hz
+                    loaded_chunk_align_window_s = (
+                        self._loaded_inference_chunk_align_window_s
+                    )
+                    loaded_initial_pose_sync = (
+                        self._loaded_inference_initial_pose_sync
+                    )
+                    loaded_initial_pose_sync_duration_s = (
+                        self._loaded_inference_initial_pose_sync_duration_s
+                    )
                 start_handled = False
                 if (
                     existing_client is not None
                     and existing_client._service_prefix == service_prefix
                 ):
-                    loaded_signature = (
+                    with self._state_lock:
+                        cycle_prepared = self._inference_cycle_prepared
+                    loaded_signature = inference_runtime_signature(
                         loaded_policy_path,
                         loaded_acceleration_mode,
                         loaded_acceleration_engine_path,
                         loaded_action_request_mode,
+                        loaded_control_hz,
+                        loaded_inference_hz,
+                        loaded_chunk_align_window_s,
+                        loaded_initial_pose_sync,
+                        loaded_initial_pose_sync_duration_s,
                     )
-                    requested_signature = (
+                    requested_signature = inference_runtime_signature(
                         requested_policy_path,
                         requested_acceleration_mode,
                         requested_acceleration_engine_path,
                         requested_action_request_mode,
+                        requested_control_hz,
+                        requested_inference_hz,
+                        requested_chunk_align_window_s,
+                        requested_initial_pose_sync,
+                        requested_initial_pose_sync_duration_s,
                     )
                     if (
                         requested_policy_path
@@ -1382,7 +1651,11 @@ class OrchestratorNode(Node):
                         self._teardown_inference_client()
                     else:
                         resume_result = existing_client.inference_command(
-                            ContainerServiceClient.CMD_RESUME,
+                            (
+                                ContainerServiceClient.CMD_RESET_CYCLE
+                                if cycle_prepared
+                                else ContainerServiceClient.CMD_RESUME
+                            ),
                             task_instruction=task_instruction,
                             publish_to_robot=publish_to_robot,
                         )
@@ -1391,26 +1664,67 @@ class OrchestratorNode(Node):
                                 self._loaded_inference_publish_to_robot = (
                                     publish_to_robot
                                 )
+                                self._inference_cycle_prepared = False
                             self._set_session_active(
                                 on_inference=True,
                                 start_time=time.perf_counter(),
                             )
-                            self._publish_inference_phase(
-                                InferenceStatus.INFERENCING)
-                            response.success = True
-                            response.message = (
-                                'Inference resumed (model already loaded)'
+                            needs_initial_pose_sync = (
+                                (resume_result.message or '').strip().lower()
+                                == 'syncing'
                             )
+                            if needs_initial_pose_sync:
+                                self._begin_initial_pose_sync_status(
+                                    existing_client,
+                                    loaded_initial_pose_sync_duration_s,
+                                )
+                            else:
+                                self._publish_inference_phase(
+                                    InferenceStatus.INFERENCING)
+                            response.success = True
+                            if needs_initial_pose_sync:
+                                response.message = (
+                                    'Initial pose sync started after Cycle Home'
+                                    if cycle_prepared
+                                    else 'Initial pose sync started'
+                                )
+                            else:
+                                response.message = (
+                                    'Fresh inference cycle started after Cycle Home'
+                                    if cycle_prepared
+                                    else 'Inference resumed (model already loaded)'
+                                )
                             start_handled = True
                         else:
                             resume_message = resume_result.message or ''
-                            if resume_message in ('not running', 'LOAD first'):
-                                self.get_logger().warning(
-                                    'Cached inference client for '
-                                    f'{service_prefix} is stale '
-                                    f'({resume_message}); reloading policy'
-                                )
-                                self._teardown_inference_client()
+                            if self._is_stale_inference_client_failure(
+                                resume_message
+                            ):
+                                if self._discard_stale_inference_client(
+                                    existing_client
+                                ):
+                                    self.get_logger().warning(
+                                        'Cached inference client for '
+                                        f'{service_prefix} is stale '
+                                        f'({resume_message}); reloading policy'
+                                    )
+                                else:
+                                    # RESUME can wait up to 10 seconds. If a
+                                    # concurrent STOP/reload replaced the
+                                    # client in that window, the result
+                                    # belongs to the old session. Never tear
+                                    # down or overwrite the newer client.
+                                    self.get_logger().warning(
+                                        'Ignoring stale RESUME result for '
+                                        f'{service_prefix}; inference client '
+                                        'changed while the call was pending'
+                                    )
+                                    response.success = False
+                                    response.message = (
+                                        'Inference session changed while '
+                                        'RESUME was pending'
+                                    )
+                                    start_handled = True
                             else:
                                 response.success = False
                                 response.message = resume_message
@@ -1471,6 +1785,15 @@ class OrchestratorNode(Node):
                                         requested_acceleration_engine_path
                                     ),
                                     action_request_mode=requested_action_request_mode,
+                                    control_hz=requested_control_hz,
+                                    inference_hz=requested_inference_hz,
+                                    chunk_align_window_s=(
+                                        requested_chunk_align_window_s
+                                    ),
+                                    initial_pose_sync=requested_initial_pose_sync,
+                                    initial_pose_sync_duration_s=(
+                                        requested_initial_pose_sync_duration_s
+                                    ),
                                 )
 
                             with self._inference_lifecycle_lock:
@@ -1566,14 +1889,39 @@ class OrchestratorNode(Node):
                                     self._loaded_inference_action_request_mode = (
                                         requested_action_request_mode
                                     )
+                                    self._loaded_inference_control_hz = (
+                                        requested_control_hz
+                                    )
+                                    self._loaded_inference_inference_hz = (
+                                        requested_inference_hz
+                                    )
+                                    self._loaded_inference_chunk_align_window_s = (
+                                        requested_chunk_align_window_s
+                                    )
+                                    self._loaded_inference_initial_pose_sync = (
+                                        requested_initial_pose_sync
+                                    )
+                                    self._loaded_inference_initial_pose_sync_duration_s = (
+                                        requested_initial_pose_sync_duration_s
+                                    )
+                                    self._inference_cycle_prepared = False
 
                                 self._set_session_active(
                                     on_inference=True,
                                     start_time=time.perf_counter(),
                                 )
-                                self._publish_inference_phase(
-                                    InferenceStatus.INFERENCING
-                                )
+                                if (
+                                    (start_result.message or '').strip().lower()
+                                    == 'syncing'
+                                ):
+                                    self._begin_initial_pose_sync_status(
+                                        client,
+                                        requested_initial_pose_sync_duration_s,
+                                    )
+                                else:
+                                    self._publish_inference_phase(
+                                        InferenceStatus.INFERENCING
+                                    )
                         except Exception as e:
                             self.get_logger().error(
                                 f'Async LOAD/START error: {e}', exc_info=True
@@ -1748,6 +2096,15 @@ class OrchestratorNode(Node):
                     selected_joints=list(
                         getattr(request, 'selected_joints', []) or []
                     ),
+                    tactile_mode=str(
+                        getattr(request, 'tactile_mode', '') or 'off'
+                    ),
+                    selected_tactile_topics=list(
+                        getattr(request, 'selected_tactile_topics', []) or []
+                    ),
+                    tactile_baseline_samples=int(
+                        getattr(request, 'tactile_baseline_samples', 0) or 20
+                    ),
                 )
                 if not result.success or result.response is None:
                     response.success = False
@@ -1810,6 +2167,9 @@ class OrchestratorNode(Node):
                         # flag — that field was removed); orchestrator
                         # still owns inference teardown + timer_manager.
                         self.get_logger().info('Cancelling current recording (forwarder)')
+                        sync_stop_verified_client = (
+                            self._prepare_active_initial_pose_sync_teardown()
+                        )
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.RERECORD,
                             task_info=request.task_info,
@@ -1818,7 +2178,9 @@ class OrchestratorNode(Node):
                                 and cd_result.response is not None
                                 and cd_result.response.success):
                             # Inference teardown stays orchestrator-side.
-                            self._teardown_inference_client()
+                            self._teardown_inference_client(
+                                stop_verified_client=sync_stop_verified_client,
+                            )
                             self._set_session_active(
                                 on_recording=False, on_inference=False,
                             )
@@ -1835,11 +2197,13 @@ class OrchestratorNode(Node):
                         with self._state_lock:
                             client = self.container_service_client
                         if client is not None:
-                            result = client.inference_command(
-                                ContainerServiceClient.CMD_PAUSE,
-                            )
+                            result = self._pause_inference_client(client)
                             if result.success:
-                                self._publish_inference_phase(InferenceStatus.PAUSED)
+                                self._publish_inference_phase(
+                                    InferenceStatus.PAUSED,
+                                )
+                                # Stop does not turn a pending fresh cycle into
+                                # continuation of the episode before Home.
                             response.success = result.success
                             response.message = result.message or 'Inference paused'
                         else:
@@ -1852,25 +2216,133 @@ class OrchestratorNode(Node):
                             loaded_publish_to_robot = (
                                 self._loaded_inference_publish_to_robot
                             )
+                            loaded_initial_pose_sync_duration_s = (
+                                self._loaded_inference_initial_pose_sync_duration_s
+                            )
+                            cycle_prepared = self._inference_cycle_prepared
                         if client is not None:
+                            task_info = request.task_info
+                            try:
+                                requested_publish_to_robot = (
+                                    publish_to_robot_override_from_task_info(
+                                        task_info
+                                    )
+                                )
+                            except ValueError as exc:
+                                response.success = False
+                                response.message = str(exc)
+                                return response
+                            resume_publish_to_robot = (
+                                loaded_publish_to_robot
+                                if requested_publish_to_robot is None
+                                else requested_publish_to_robot
+                            )
                             task_instruction = (
-                                request.task_info.task_instruction[0]
-                                if request.task_info.task_instruction
+                                task_info.task_instruction[0]
+                                if task_info.task_instruction
                                 else ''
                             )
                             result = client.inference_command(
-                                ContainerServiceClient.CMD_RESUME,
+                                (
+                                    ContainerServiceClient.CMD_RESET_CYCLE
+                                    if cycle_prepared
+                                    else ContainerServiceClient.CMD_RESUME
+                                ),
                                 task_instruction=task_instruction,
-                                publish_to_robot=loaded_publish_to_robot,
+                                publish_to_robot=resume_publish_to_robot,
                             )
                             if result.success:
-                                self.on_inference = True
-                                self._publish_inference_phase(InferenceStatus.INFERENCING)
+                                with self._state_lock:
+                                    if self.container_service_client is client:
+                                        self._loaded_inference_publish_to_robot = (
+                                            resume_publish_to_robot
+                                        )
+                                        self._inference_cycle_prepared = False
+                                if cycle_prepared:
+                                    self._set_session_active(
+                                        on_inference=True,
+                                        start_time=time.perf_counter(),
+                                    )
+                                else:
+                                    self._set_session_active(on_inference=True)
+                                needs_initial_pose_sync = (
+                                    (result.message or '').strip().lower()
+                                    == 'syncing'
+                                )
+                                if needs_initial_pose_sync:
+                                    self._begin_initial_pose_sync_status(
+                                        client,
+                                        loaded_initial_pose_sync_duration_s,
+                                    )
+                                else:
+                                    self._publish_inference_phase(
+                                        InferenceStatus.INFERENCING)
                             response.success = result.success
-                            response.message = result.message or 'Inference resumed'
+                            response.message = (
+                                'Fresh inference cycle started after Cycle Home'
+                                if result.success and cycle_prepared
+                                else result.message or 'Inference resumed'
+                            )
                         else:
                             response.success = False
                             response.message = 'No inference session active'
+
+                    elif request.command == PREPARE_NEXT_CYCLE_COMMAND:
+                        with self._state_lock:
+                            client = self.container_service_client
+                            publish_to_robot = self._loaded_inference_publish_to_robot
+                        if client is None:
+                            response.success = False
+                            response.message = 'No inference session active'
+                        elif not publish_to_robot:
+                            response.success = False
+                            response.message = (
+                                'Cycle Home is available only for Real Robot Deploy'
+                            )
+                        elif self.robot_type != 'ffw_sh5_rev1':
+                            response.success = False
+                            response.message = (
+                                'Cycle Home is configured only for ffw_sh5_rev1'
+                            )
+                        elif self.communicator is None:
+                            response.success = False
+                            response.message = 'Robot communicator is not ready'
+                        else:
+                            # Never request physical pose return until policy
+                            # publishing has acknowledged PAUSE.
+                            with self._inference_lifecycle_lock:
+                                pause_result = client.inference_command(
+                                    ContainerServiceClient.CMD_PAUSE,
+                                )
+                                if not pause_result.success:
+                                    response.success = False
+                                    response.message = (
+                                        pause_result.message
+                                        or 'Failed to pause inference before homing'
+                                    )
+                                else:
+                                    # PAUSE is already authoritative even if
+                                    # the subsequent pose-return publication
+                                    # fails; keep the UI lifecycle truthful.
+                                    self._publish_inference_phase(
+                                        InferenceStatus.PAUSED
+                                    )
+                                    with self._state_lock:
+                                        if self.container_service_client is client:
+                                            self._inference_cycle_prepared = True
+                                    home_success, home_message = (
+                                        self.communicator.publish_initial_pose_return()
+                                    )
+                                    if home_success:
+                                        response.success = True
+                                        response.message = (
+                                            'Inference paused and task initial-pose '
+                                            'return requested. Wait until motion stops, '
+                                            'reset the cups with hands clear, then press Start.'
+                                        )
+                                    else:
+                                        response.success = False
+                                        response.message = home_message
 
                     elif request.command == SendCommand.Request.UPDATE_INSTRUCTION:
                         # Mid-run language re-conditioning. Lifecycle stays
@@ -1994,12 +2466,19 @@ class OrchestratorNode(Node):
                             f'{"inference session" if is_inference_clear else "recording"} '
                             '(forwarder)'
                         )
+                        sync_stop_verified_client = None
+                        if is_inference_clear:
+                            sync_stop_verified_client = (
+                                self._prepare_active_initial_pose_sync_teardown()
+                            )
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.FINISH,
                             task_info=request.task_info,
                         )
                         if is_inference_clear:
-                            self._teardown_inference_client()
+                            self._teardown_inference_client(
+                                stop_verified_client=sync_stop_verified_client,
+                            )
                             self._set_session_active(
                                 on_recording=False, on_inference=False,
                             )
@@ -2031,11 +2510,16 @@ class OrchestratorNode(Node):
                         # Simplified-mode semantics: skip == stop-and-save
                         # plus tear down inference state.
                         self.get_logger().info('Skipping current recording (forwarder)')
+                        sync_stop_verified_client = (
+                            self._prepare_active_initial_pose_sync_teardown()
+                        )
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.RERECORD,
                             task_info=request.task_info,
                         )
-                        self._teardown_inference_client()
+                        self._teardown_inference_client(
+                            stop_verified_client=sync_stop_verified_client,
+                        )
                         self._set_session_active(
                             on_recording=False, on_inference=False,
                         )
@@ -2060,12 +2544,19 @@ class OrchestratorNode(Node):
                             'Discarding current recording '
                             f'({"inference session" if is_inference_cancel else "record-only"})'
                         )
+                        sync_stop_verified_client = None
+                        if is_inference_cancel:
+                            sync_stop_verified_client = (
+                                self._prepare_active_initial_pose_sync_teardown()
+                            )
                         cd_result = self._forward_recording(
                             RecordingCommand.Request.CANCEL,
                             task_info=request.task_info,
                         )
                         if is_inference_cancel:
-                            self._teardown_inference_client()
+                            self._teardown_inference_client(
+                                stop_verified_client=sync_stop_verified_client,
+                            )
                             self._set_session_active(
                                 on_recording=False, on_inference=False,
                             )
@@ -2455,8 +2946,8 @@ class OrchestratorNode(Node):
     # LeRobot policy types (used for service_prefix detection)
     LEROBOT_POLICIES = {
         'tdmpc', 'diffusion', 'act', 'vqbet', 'pi0', 'pi0_fast', 'pi05',
-        'smolvla', 'xvla', 'gaussian_actor',
-        'molmoact2', 'vla_jepa', 'fastwam',
+        'smolvla', 'trex', 'xvla', 'gaussian_actor',
+        'molmoact2', 'vla_jepa', 'fastwam', 'tactile_act', 'sac',
     }
 
     @staticmethod
@@ -2471,6 +2962,36 @@ class OrchestratorNode(Node):
     def _is_policy_already_loaded_message(message: str) -> bool:
         value = str(message or '').lower()
         return 'already loaded' in value and 'unload' in value
+
+    @staticmethod
+    def _is_stale_inference_client_failure(message: str) -> bool:
+        """Return whether cached-client RESUME should retry as a fresh LOAD.
+
+        A policy container can be restarted independently of orchestrator.
+        The cached client then still identifies the same backend/policy, but
+        RESUME cannot reach its old service endpoint. Only lifecycle replies
+        that mean "nothing is loaded" and transport/discovery messages
+        emitted by ``ContainerServiceClient`` are recoverable here.
+
+        Deliberately do not classify arbitrary backend failures (or a
+        cancelled call) as stale: a cancellation can be caused by a
+        concurrent user-requested teardown, and retrying it could resurrect
+        inference after STOP.
+        """
+        value = ' '.join(str(message or '').strip().lower().split())
+        if value in {'not running', 'load first'}:
+            return True
+
+        transport_failure_prefixes = (
+            'not connected to container services',
+            'service client not initialized:',
+            'service not available after ',
+            'service call returned none:',
+            'service call timed out:',
+            'service call failed:',
+            'no response from service (timeout or error)',
+        )
+        return value.startswith(transport_failure_prefixes)
 
     @staticmethod
     def _normalize_acceleration_mode(value: str) -> str:
@@ -2502,6 +3023,10 @@ class OrchestratorNode(Node):
     @staticmethod
     def _normalize_action_request_mode(value: str) -> str:
         mode = str(value or '').strip().lower()
+        if mode in {'async_ordered', 'ordered_async'}:
+            return 'async_ordered'
+        if mode in {'sync_step', 'step_sync'}:
+            return 'sync_step'
         if mode == 'sync':
             return 'sync'
         return 'async'
@@ -2512,25 +3037,66 @@ class OrchestratorNode(Node):
             getattr(task_info, 'action_request_mode', '')
         )
 
+    @staticmethod
+    def _initial_pose_sync_from_task_info(task_info) -> tuple[bool, float]:
+        enabled = bool(getattr(task_info, 'initial_pose_sync', False))
+        raw_duration = getattr(task_info, 'initial_pose_sync_duration_s', 0.0)
+        duration_s = float(raw_duration or 5.0)
+        if not math.isfinite(duration_s) or not 1.0 <= duration_s <= 60.0:
+            raise ValueError(
+                'Initial Pose Sync duration must be between 1.0 and 60.0 seconds'
+            )
+        return enabled, duration_s
+
     def _determine_service_prefix(self, task_info) -> str:
         """Determine inference service prefix from task_info or policy config.
 
-        1. If task_info has service_type field, use it directly.
-        2. Otherwise, read policy_path/config.json to detect policy type.
-        3. LeRobot policy types -> "/lerobot", default -> "/groot".
+        ViTacFormer model metadata is authoritative because older UI bundles
+        advertised ViTacFormer as a LeRobot policy and therefore sent
+        ``service_type=lerobot``.  For all other models, an explicit
+        ``service_type`` remains authoritative before the normal config-based
+        fallback is used.
         """
-        # Check for explicit service_type in task_info
-        service_type = getattr(task_info, 'service_type', None)
-        if service_type:
-            prefix = f'/{service_type.strip("/")}'
-            self.get_logger().info(f'Service prefix from task_info: {prefix}')
-            return prefix
-
         # Detect from policy config. LeRobot training output nests the
         # checkpoint under <root>/pretrained_model/ — try that path too
         # so users who paste the training root still get the right routing.
+        service_type = str(
+            getattr(task_info, 'service_type', '') or ''
+        ).strip('/')
         policy_path = getattr(task_info, 'policy_path', '')
+        detected_policy_type = ''
         if policy_path:
+            selected = Path(policy_path)
+            root = selected.parent if selected.is_file() else selected
+            train_config_path = next(
+                (
+                    candidate / 'train_config.json'
+                    for candidate in (root, *list(root.parents)[:3])
+                    if (candidate / 'train_config.json').exists()
+                ),
+                None,
+            )
+            if train_config_path is not None:
+                try:
+                    with open(train_config_path) as f:
+                        train_config = json.load(f)
+                    architecture = str(
+                        train_config.get('architecture', '')
+                    ).lower()
+                    if 'vitacformer' in architecture:
+                        if service_type and service_type != 'vitacformer':
+                            self.get_logger().warning(
+                                'ViTacFormer model metadata overrides '
+                                f'conflicting service_type={service_type!r}'
+                            )
+                        self.get_logger().info(
+                            'Detected dedicated ViTacFormer training output'
+                        )
+                        return '/vitacformer'
+                except Exception as e:
+                    self.get_logger().warning(
+                        f'Failed to read ViTacFormer train config: {e}'
+                    )
             root = Path(policy_path)
             config_path = root / 'config.json'
             if not config_path.exists() and (root / 'pretrained_model' / 'config.json').exists():
@@ -2539,21 +3105,94 @@ class OrchestratorNode(Node):
                 try:
                     with open(config_path) as f:
                         config = json.load(f)
-                    policy_type = config.get('type', '')
-                    if policy_type in self.LEROBOT_POLICIES:
+                    detected_policy_type = str(config.get('type', '')).lower()
+                    if detected_policy_type == 'vitacformer':
+                        if service_type and service_type != 'vitacformer':
+                            self.get_logger().warning(
+                                'ViTacFormer policy metadata overrides '
+                                f'conflicting service_type={service_type!r}'
+                            )
                         self.get_logger().info(
-                            f'Detected LeRobot policy type: {policy_type}'
+                            'Detected dedicated ViTacFormer policy type'
                         )
-                        return '/lerobot'
+                        return '/vitacformer'
                 except Exception as e:
                     self.get_logger().warning(
                         f'Failed to read policy config: {e}'
                     )
 
+        if service_type:
+            prefix = f'/{service_type}'
+            self.get_logger().info(f'Service prefix from task_info: {prefix}')
+            return prefix
+
+        if detected_policy_type in self.LEROBOT_POLICIES:
+            self.get_logger().info(
+                f'Detected LeRobot policy type: {detected_policy_type}'
+            )
+            return '/lerobot'
+
         # Default to groot for backward compatibility
         return '/groot'
 
-    def _teardown_inference_client(self, expected_client=None):
+    def _detach_inference_client(self, expected_client=None):
+        """Atomically detach a client and clear its cached load signature."""
+        sync_timer = None
+        with self._state_lock:
+            client = self.container_service_client
+            if expected_client is not None and client is not expected_client:
+                return None
+            sync_timer = self._initial_pose_sync_status_timer
+            self._initial_pose_sync_status_timer = None
+            self._initial_pose_sync_status_generation += 1
+            self.container_service_client = None
+            self._loaded_inference_policy_path = ''
+            self._loaded_inference_publish_to_robot = False
+            self._loaded_inference_acceleration_mode = 'pytorch'
+            self._loaded_inference_acceleration_engine_path = ''
+            self._loaded_inference_action_request_mode = 'async'
+            self._loaded_inference_control_hz = 100
+            self._loaded_inference_inference_hz = 15
+            self._loaded_inference_chunk_align_window_s = 0.3
+            self._loaded_inference_initial_pose_sync = False
+            self._loaded_inference_initial_pose_sync_duration_s = 5.0
+            self._initial_pose_sync_hold_pending = False
+        if sync_timer is not None:
+            sync_timer.cancel()
+        return client
+
+    def _discard_stale_inference_client(self, expected_client) -> bool:
+        """Detach a stale cached client without remote STOP/UNLOAD calls.
+
+        A discovery/transport failure means the cached ROS endpoint is no
+        longer authoritative. Issuing cleanup commands against it is both
+        unnecessary and unsafe: the old cleanup thread could acquire the
+        lifecycle lock after a replacement session starts and unload that
+        new session. The identity check also prevents a delayed RESUME
+        result from detaching a newer client.
+        """
+        if expected_client is None:
+            return False
+        client = self._detach_inference_client(
+            expected_client=expected_client
+        )
+        if client is None:
+            return False
+
+        try:
+            client._cancelled.set()
+            client.disconnect()
+        except Exception as e:
+            self.get_logger().warning(
+                f'Error discarding stale inference client: {e}'
+            )
+        return True
+
+    def _teardown_inference_client(
+        self,
+        expected_client=None,
+        stop_verified_client=None,
+    ):
         """Tear down the container service client (STOP + UNLOAD + disconnect).
 
         Called on inference session end (FINISH), on LOAD/START failure so
@@ -2562,26 +3201,68 @@ class OrchestratorNode(Node):
         UNLOAD call happens on a background thread so UI keeps responding
         while CUDA memory releases.
         """
-        # Atomic swap: detach the client under the lock so concurrent
-        # callers (RESUME path, joystick handler, daemon thread) can't
-        # both grab the same client and double-disconnect.
         with self._state_lock:
             client = self.container_service_client
             if expected_client is not None and client is not expected_client:
                 return
+            sync_was_active = (
+                client is not None
+                and (
+                    self._initial_pose_sync_status_timer is not None
+                    or self._initial_pose_sync_hold_pending
+                )
+            )
+            sync_stop_required = (
+                sync_was_active
+                or (
+                    client is not None
+                    and self._loaded_inference_publish_to_robot
+                    and self._loaded_inference_initial_pose_sync
+                )
+            )
+
+        stop_verified = stop_verified_client is client
+        if sync_stop_required and not stop_verified:
+            stop_verified = self._stop_initial_pose_sync_for_teardown(
+                client,
+                force=True,
+            )
+
+        # Atomic swap: detach the client under the lock so concurrent
+        # callers (RESUME path, joystick handler, daemon thread) can't
+        # both grab the same client and double-disconnect.
+        with self._state_lock:
+            if self.container_service_client is not client:
+                return
+            if expected_client is not None and client is not expected_client:
+                return
+            sync_timer = self._initial_pose_sync_status_timer
+            self._initial_pose_sync_status_timer = None
+            self._initial_pose_sync_status_generation += 1
             self.container_service_client = None
             self._loaded_inference_policy_path = ''
+            self._model_switch_needs_retry = False
             self._loaded_inference_publish_to_robot = False
             self._loaded_inference_acceleration_mode = 'pytorch'
             self._loaded_inference_acceleration_engine_path = ''
             self._loaded_inference_action_request_mode = 'async'
+            self._loaded_inference_control_hz = 100
+            self._loaded_inference_inference_hz = 15
+            self._loaded_inference_chunk_align_window_s = 0.3
+            self._loaded_inference_initial_pose_sync = False
+            self._loaded_inference_initial_pose_sync_duration_s = 5.0
+            self._initial_pose_sync_hold_pending = False
+            self._inference_cycle_prepared = False
+        if sync_timer is not None:
+            sync_timer.cancel()
         if client is None:
             return
 
         def _cleanup():
             try:
                 with self._inference_lifecycle_lock:
-                    client.inference_command(ContainerServiceClient.CMD_STOP)
+                    if not stop_verified:
+                        client.inference_command(ContainerServiceClient.CMD_STOP)
                     client.inference_command(ContainerServiceClient.CMD_UNLOAD)
             except Exception as e:
                 self.get_logger().error(f'Error tearing down inference: {e}')
@@ -2807,7 +3488,10 @@ class OrchestratorNode(Node):
         """
         Handle leader tact triggers as backend-owned recording controls.
 
-        ``right`` toggles start/save. ``left`` cancels the active recording.
+        A short click remains dedicated to mini-leader arm enable/disable.
+        A right long press toggles start/save; a left long press cancels the
+        active recording. Keeping recording on long presses prevents one tact
+        click from changing arm control and recording state at the same time.
         """
         self.get_logger().info(f'Joystick trigger: {joystick_mode}')
 
@@ -2816,49 +3500,50 @@ class OrchestratorNode(Node):
                 f'Joystick trigger ignored without communicator: {joystick_mode}')
             return
 
-        if joystick_mode in ('right', 'left'):
-            snapshot_on_recording, snapshot_on_inference = (
-                self._snapshot_session_state()
-            )
-            if snapshot_on_inference:
-                if self._get_inference_record_task_info() is None:
-                    self.get_logger().warning(
-                        'Inference trigger ignored: no inference task info available')
-                    return
-                if joystick_mode == 'right':
-                    self._toggle_inference_trigger_recording(snapshot_on_recording)
-                elif snapshot_on_recording:
-                    self._cancel_inference_trigger_recording()
-                else:
-                    self.get_logger().debug(
-                        'Inference trigger cancel ignored: no active recording')
-                return
+        recording_action = get_joystick_recording_action(joystick_mode)
+        if recording_action is None:
+            if joystick_mode in ARM_TOGGLE_TRIGGERS:
+                self.get_logger().debug(
+                    f'Short {joystick_mode} click reserved for mini-leader '
+                    'arm enable/disable; no recording action')
+            else:
+                self.get_logger().info(
+                    f'Unknown joystick trigger: {joystick_mode}')
+            return
 
-            if self._prepared_record_task_info is None:
+        snapshot_on_recording, snapshot_on_inference = (
+            self._snapshot_session_state()
+        )
+        if snapshot_on_inference:
+            if self._get_inference_record_task_info() is None:
                 self.get_logger().warning(
-                    'Record trigger ignored: prepare the Record session first')
+                    'Inference trigger ignored: no inference task info available')
                 return
-            if joystick_mode == 'right':
-                if snapshot_on_recording:
-                    self._stop_record_trigger_segment()
-                else:
-                    self._start_record_trigger_segment(
-                        int(self._trigger_record_next_segment_index)
-                    )
+            if recording_action == RECORD_TOGGLE_ACTION:
+                self._toggle_inference_trigger_recording(snapshot_on_recording)
             elif snapshot_on_recording:
-                self._cancel_record_trigger_segment()
+                self._cancel_inference_trigger_recording()
             else:
                 self.get_logger().debug(
-                    'Record trigger cancel ignored: no active recording')
+                    'Inference trigger cancel ignored: no active recording')
+            return
 
-        elif joystick_mode == 'right_long_time':
-            self.get_logger().info('Right long press - reserved for future use')
-
-        elif joystick_mode == 'left_long_time':
-            self.get_logger().info('Left long press - reserved for future use')
-
+        if self._prepared_record_task_info is None:
+            self.get_logger().warning(
+                'Record trigger ignored: prepare the Record session first')
+            return
+        if recording_action == RECORD_TOGGLE_ACTION:
+            if snapshot_on_recording:
+                self._stop_record_trigger_segment()
+            else:
+                self._start_record_trigger_segment(
+                    int(self._trigger_record_next_segment_index)
+                )
+        elif recording_action == RECORD_CANCEL_ACTION and snapshot_on_recording:
+            self._cancel_record_trigger_segment()
         else:
-            self.get_logger().info(f'Unknown joystick trigger: {joystick_mode}')
+            self.get_logger().debug(
+                'Record trigger cancel ignored: no active recording')
 
     # _auto_create_recording_session removed in Step 3 Part C2d-5 — the
     # joystick handler now reuses self._last_ui_task_info + forwards START

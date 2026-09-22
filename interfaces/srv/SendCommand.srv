@@ -37,6 +37,16 @@ uint8 FINISH_EPISODE = 21
 uint8 DISCARD_EPISODE = 22
 uint8 SET_TASK_INFO = 23
 uint8 CANCEL_SEGMENT = 24
+# Pause policy output first, then request the configured Task_000423 initial
+# pose. The next RESUME_INFERENCE starts a fresh logical policy cycle.
+uint8 PREPARE_NEXT_CYCLE = 25
+# Pause, switch SH5 ViTacFormer checkpoint, then resume in the loaded mode.
+uint8 SWITCH_INFERENCE_MODEL = 26
+# Optional resident-model preparation; no robot output.
+uint8 PRELOAD_INFERENCE_MODEL = 27
+uint8 CLEAR_PRELOADED_MODEL = 28
+# Requires a matching preloaded model; never falls back to disk loading.
+uint8 SWITCH_PRELOADED_MODEL = 29
 
 uint8 command
 TaskInfo task_info
@@ -61,7 +71,8 @@ bool convert_v30
 
 # CONVERT_MP4 selection knobs — forwarded to StartConversion.srv when
 # the orchestrator dispatches conversion. All optional; empty / 0 means
-# "use everything from robot_config" so older UIs keep working.
+# "use everything from robot_config" so older UIs keep working. Empty
+# tactile_mode means "off".
 string[] selected_cameras
 string[] camera_rotation_keys
 uint16[] camera_rotation_values
@@ -70,6 +81,12 @@ uint16 image_resize_width
 string[] selected_state_topics
 string[] selected_action_topics
 string[] selected_joints
+string tactile_mode
+string[] selected_tactile_topics
+uint16 tactile_baseline_samples
 ---
 bool success
 string message
+# SWITCH_INFERENCE_MODEL only: authoritative result, including partial failure.
+string loaded_policy_path
+uint8 inference_phase

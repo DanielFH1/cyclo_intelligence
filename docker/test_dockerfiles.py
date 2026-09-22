@@ -37,6 +37,8 @@ def test_interactive_bashrc_includes_simple_ros_zenoh_block():
         REPO_ROOT / "cyclo_brain" / "policy" / "lerobot" / "Dockerfile.amd64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.arm64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.amd64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.arm64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.amd64",
     )
     required = (
         "export ROS_DOMAIN_ID=30",
@@ -68,6 +70,8 @@ def test_dockerfiles_prepend_ros_zenoh_block_before_existing_bashrc():
         REPO_ROOT / "cyclo_brain" / "policy" / "lerobot" / "Dockerfile.amd64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.arm64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.amd64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.arm64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.amd64",
     )
 
     for dockerfile in dockerfiles:
@@ -87,6 +91,8 @@ def test_ros_zenoh_runtime_env_file_is_not_referenced_by_images_or_s6():
         REPO_ROOT / "cyclo_brain" / "policy" / "lerobot" / "Dockerfile.amd64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.arm64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.amd64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.arm64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.amd64",
         REPO_ROOT / "docker" / "s6-services" / "common" / "ros2_service_run.sh",
         REPO_ROOT / "cyclo_brain" / "policy" / "common" / "s6-services" / "main-runtime" / "run",
         REPO_ROOT / "cyclo_brain" / "policy" / "common" / "s6-services" / "engine-process" / "run",
@@ -270,6 +276,8 @@ def test_policy_compose_keeps_image_defaults_in_images():
         REPO_ROOT / "cyclo_brain" / "policy" / "lerobot" / "Dockerfile.amd64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.arm64",
         REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.amd64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.arm64",
+        REPO_ROOT / "cyclo_brain" / "policy" / "vitacformer" / "Dockerfile.amd64",
     )
     for dockerfile in policy_dockerfiles:
         contents = dockerfile.read_text()
@@ -288,9 +296,112 @@ def test_lerobot_images_install_new_policy_inference_extras():
         install_lines = [
             line
             for line in dockerfile.read_text().splitlines()
-            if "pip install" in line and '".[' in line
+            if "default)" in line and "pip install" in line and '".[' in line
         ]
         assert len(install_lines) == 1, f"Could not identify LeRobot extras in {dockerfile}"
         install_line = install_lines[0]
         for extra in ("molmoact2", "vla_jepa", "fastwam"):
             assert extra in install_line, f"{dockerfile} is missing inference extra {extra}"
+
+
+def test_groot_amd64_keeps_numpy_compatible_with_opencv():
+    dockerfile = (
+        REPO_ROOT / "cyclo_brain" / "policy" / "groot" / "Dockerfile.amd64"
+    )
+    contents = dockerfile.read_text()
+
+    assert contents.count('"numpy==1.26.4"') >= 3
+    assert contents.count('"ml_dtypes==0.5.4"') >= 2
+
+
+def test_lerobot_trex_flavor_is_isolated_and_pinned():
+    default_extras = {
+        "Dockerfile.arm64": ".[training,smolvla,xvla,molmoact2,vla_jepa,fastwam,hilserl,async,peft]",
+        "Dockerfile.amd64": ".[dataset,smolvla,xvla,molmoact2,vla_jepa,fastwam,hilserl,async,peft]",
+    }
+    for filename, normal_install in default_extras.items():
+        dockerfile = (
+            REPO_ROOT / "cyclo_brain" / "policy" / "lerobot" / filename
+        )
+        contents = dockerfile.read_text()
+        assert "ARG LEROBOT_POLICY_FLAVOR=default" in contents
+        assert normal_install in contents
+        assert 'trex) ' in contents and '".[training,async]"' in contents
+        assert '"transformers==4.57.3"' in contents
+        assert '"tokenizers==0.22.2"' in contents
+        assert '"huggingface-hub==0.36.2"' in contents
+        assert "--no-deps" in contents
+        assert "from transformers import Qwen3VLForConditionalGeneration" in contents
+
+
+def test_trex_compose_override_preserves_lerobot_runtime_identity():
+    compose = (REPO_ROOT / "docker" / "docker-compose.yml").read_text()
+    trex = (REPO_ROOT / "docker" / "docker-compose.trex.yml").read_text()
+    supervisor = (REPO_ROOT / "docker" / "supervisor_api" / "app.py").read_text()
+    orchestrator = (
+        REPO_ROOT / "orchestrator" / "orchestrator" / "orchestrator_node.py"
+    ).read_text()
+    bt_action = (
+        REPO_ROOT
+        / "orchestrator"
+        / "orchestrator"
+        / "bt"
+        / "actions"
+        / "send_command.py"
+    ).read_text()
+    model_selector = (
+        REPO_ROOT
+        / "orchestrator"
+        / "ui"
+        / "src"
+        / "components"
+        / "InferenceModelSelector.js"
+    ).read_text()
+
+    assert "LEROBOT_POLICY_FLAVOR: ${LEROBOT_POLICY_FLAVOR:-default}" in compose
+    assert "CYCLO_LEROBOT_POLICY_FLAVOR=${CYCLO_LEROBOT_POLICY_FLAVOR:-default}" in compose
+    assert "robotis/lerobot-trex-zenoh:1.3.2-${ARCH:-arm64}" in trex
+    assert "LEROBOT_POLICY_FLAVOR: trex" in trex
+    assert "CYCLO_LEROBOT_POLICY_FLAVOR=trex" in trex
+    assert "HF_HUB_CACHE=/root/.cache/huggingface/hub" in trex
+    assert "HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface/hub" in trex
+    assert "TRANSFORMERS_CACHE=/root/.cache/huggingface/hub" in trex
+    assert "INFERENCE_HZ=${TREX_RUNTIME_ACTION_HZ:-1.25}" in trex
+    assert "REFILL_MARGIN_S=${TREX_REFILL_MARGIN_S:-2.0}" in trex
+    assert "TREX_RUNTIME_ACTION_HZ=${TREX_RUNTIME_ACTION_HZ:-1.25}" in trex
+    assert "TREX_REFILL_MARGIN_S=${TREX_REFILL_MARGIN_S:-2.0}" in trex
+    assert "container_name:" not in trex
+    assert '"CYCLO_LEROBOT_POLICY_FLAVOR", "default"' in supervisor
+    assert '"docker-compose.trex.yml"' in supervisor
+    assert "'smolvla', 'trex', 'xvla'" in orchestrator
+    assert "'lerobot:trex': 'lerobot'" in bt_action
+    assert "value: 'lerobot:trex'" in model_selector
+    assert "'lerobot:vitacformer': 'vitacformer'" in bt_action
+    assert "value: 'vitacformer:vitacformer'" in model_selector
+
+
+def test_vitacformer_is_a_baked_dedicated_backend():
+    compose = (REPO_ROOT / "docker" / "docker-compose.yml").read_text()
+    supervisor = (REPO_ROOT / "docker" / "supervisor_api" / "app.py").read_text()
+    lerobot_engine = REPO_ROOT / "cyclo_brain" / "policy" / "lerobot" / "lerobot_engine"
+
+    assert "container_name: vitacformer_server" in compose
+    assert "robotis/vitacformer-zenoh:1.0.0-${ARCH:-arm64}" in compose
+    assert "policy/vitacformer/Dockerfile.${ARCH:-arm64}" in compose
+    assert "../cyclo_brain/policy/vitacformer" not in compose
+    assert '"container": "vitacformer_server"' in supervisor
+    assert not (lerobot_engine / "vitacformer.py").exists()
+
+    for architecture in ("arm64", "amd64"):
+        dockerfile = (
+            REPO_ROOT
+            / "cyclo_brain"
+            / "policy"
+            / "vitacformer"
+            / f"Dockerfile.{architecture}"
+        ).read_text()
+        assert "COPY policy/vitacformer/vitacformer_engine/ /app/vitacformer_engine/" in dockerfile
+        assert "COPY policy/common/runtime/ /policy_runtime/" in dockerfile
+        assert "ENV POLICY_BACKEND=vitacformer" in dockerfile
+        assert "ENV POLICY_ENGINE_MODULE=vitacformer_engine" in dockerfile
+        assert "ENV INFERENCE_HZ=30" in dockerfile

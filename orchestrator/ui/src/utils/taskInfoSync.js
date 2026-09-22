@@ -1,4 +1,24 @@
+// Copyright 2026 ROBOTIS CO., LTD.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Author: Seongwoo Kim
+
 import PageType from '../constants/pageType';
+import {
+  defaultInferenceHz,
+  resolveActionRequestMode,
+} from '../constants/policyCapabilities';
 
 const stringArray = (items) => (
   Array.isArray(items) ? items.map((item) => String(item ?? '')) : []
@@ -11,6 +31,10 @@ const numberOrDefault = (value, fallback) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 };
+
+const editableNumberOrDefault = (value, fallback) => (
+  value === '' ? '' : numberOrDefault(value, fallback)
+);
 
 const actionRequestModeOrDefault = (value) => (
   String(value ?? '').trim().toLowerCase() === 'sync' ? 'sync' : 'async'
@@ -38,15 +62,30 @@ export const normalizeInferenceTaskInfo = (taskInfo = {}) => ({
   taskInstruction: stringArray(taskInfo.taskInstruction),
   policyPath: String(taskInfo.policyPath ?? '').trim(),
   recordInferenceMode: Boolean(taskInfo.recordInferenceMode),
-  controlHz: numberOrDefault(taskInfo.controlHz ?? 100, 100),
-  inferenceHz: numberOrDefault(taskInfo.inferenceHz ?? 15, 15),
-  chunkAlignWindowS: numberOrDefault(taskInfo.chunkAlignWindowS ?? 0.3, 0.3),
+  controlHz: editableNumberOrDefault(taskInfo.controlHz ?? 100, 100),
+  inferenceHz: editableNumberOrDefault(
+    taskInfo.inferenceHz ?? defaultInferenceHz(taskInfo.serviceType, taskInfo.policyType),
+    defaultInferenceHz(taskInfo.serviceType, taskInfo.policyType)
+  ),
+  chunkAlignWindowS: editableNumberOrDefault(
+    taskInfo.chunkAlignWindowS ?? 0.3,
+    0.3
+  ),
   serviceType: String(taskInfo.serviceType ?? '').trim(),
   policyType: String(taskInfo.policyType ?? '').trim(),
   inferenceMode: String(taskInfo.inferenceMode ?? 'simulation').trim() || 'simulation',
-  actionRequestMode: actionRequestModeOrDefault(taskInfo.actionRequestMode),
+  actionRequestMode: resolveActionRequestMode(
+    taskInfo.serviceType,
+    taskInfo.policyType,
+    taskInfo.actionRequestMode
+  ),
   accelerationMode: String(taskInfo.accelerationMode ?? 'pytorch').trim(),
   accelerationEnginePath: String(taskInfo.accelerationEnginePath ?? '').trim(),
+  initialPoseSync: Boolean(taskInfo.initialPoseSync),
+  initialPoseSyncDurationS: numberOrDefault(
+    taskInfo.initialPoseSyncDurationS ?? 5.0,
+    5.0
+  ),
 });
 
 export const getRecordTaskInfoKey = (taskInfo = {}) =>
@@ -68,6 +107,11 @@ export const rosTaskInfoToUiTaskInfo = (taskInfo = {}) => ({
   actionRequestMode: actionRequestModeOrDefault(taskInfo.action_request_mode),
   accelerationMode: taskInfo.acceleration_mode || 'pytorch',
   accelerationEnginePath: taskInfo.acceleration_engine_path || '',
+  initialPoseSync: Boolean(taskInfo.initial_pose_sync),
+  initialPoseSyncDurationS: numberOrDefault(
+    taskInfo.initial_pose_sync_duration_s,
+    5.0
+  ),
   userId: taskInfo.user_id || '',
   controlHz: taskInfo.control_hz || 100,
   inferenceHz: taskInfo.inference_hz || 15,

@@ -83,6 +83,8 @@ export default function ImageGridCell({
   onClose,
   onPlusClick,
   isActive = true,
+  showControls = true,
+  objectFit = 'cover',
   style = {},
 }) {
   const normalizedRotationDegrees = normalizeRotationDegrees(rotationDegrees);
@@ -150,13 +152,12 @@ export default function ImageGridCell({
         // Late-fired error after destroyImage (src='' triggers onerror) must
         // not schedule a retry — cancelRef tells us we're already torn down.
         if (cancelRef.current) return;
-        if (retryCountRef.current >= MAX_RETRIES) {
-          console.error(`Image stream failed after ${MAX_RETRIES} retries for idx ${idx}, topic: ${topic}`);
-          return;
-        }
         retryCountRef.current += 1;
         const delay = Math.min(1000 * Math.pow(2, retryCountRef.current - 1), 8000);
-        console.warn(`Image stream error for idx ${idx}, retrying in ${delay}ms (${retryCountRef.current}/${MAX_RETRIES})`);
+        const retryLabel = retryCountRef.current >= MAX_RETRIES
+          ? `${retryCountRef.current}; continuing`
+          : `${retryCountRef.current}/${MAX_RETRIES}`;
+        console.warn(`Image stream error for idx ${idx}, retrying in ${delay}ms (${retryLabel})`);
         retryTimerRef.current = setTimeout(() => {
           if (cancelRef.current) return;
           if (isActive && topic && containerRef.current) {
@@ -173,8 +174,12 @@ export default function ImageGridCell({
       if (rotate) {
         const wrapper = document.createElement('div');
         wrapper.style.position = 'absolute';
-        wrapper.style.width = swapsDimensions ? formatPercent(100 / aspectRatio) : '100%';
-        wrapper.style.height = swapsDimensions ? formatPercent(100 * aspectRatio) : '100%';
+        wrapper.style.width = swapsDimensions
+          ? objectFit === 'contain' ? '100cqh' : formatPercent(100 / aspectRatio)
+          : '100%';
+        wrapper.style.height = swapsDimensions
+          ? objectFit === 'contain' ? '100cqw' : formatPercent(100 * aspectRatio)
+          : '100%';
         wrapper.style.top = '50%';
         wrapper.style.left = '50%';
         wrapper.style.transform = `translate(-50%, -50%) rotate(${normalizedRotationDegrees}deg)`;
@@ -183,7 +188,7 @@ export default function ImageGridCell({
 
         img.style.width = '100%';
         img.style.height = '100%';
-        img.style.objectFit = 'cover';
+        img.style.objectFit = objectFit;
         img.style.display = 'block';
 
         wrapper.appendChild(img);
@@ -194,6 +199,7 @@ export default function ImageGridCell({
         }
       } else {
         img.className = 'w-full h-full object-cover bg-gray-100';
+        img.style.objectFit = objectFit;
 
         if (containerRef.current && !cancelRef.current) {
           containerRef.current.appendChild(img);
@@ -212,6 +218,7 @@ export default function ImageGridCell({
     swapsDimensions,
     aspectRatio,
     normalizedRotationDegrees,
+    objectFit,
     destroyImage,
   ]);
 
@@ -249,7 +256,7 @@ export default function ImageGridCell({
       onClick={!topic ? () => onPlusClick(idx) : undefined}
       style={{ cursor: !topic ? 'pointer' : 'default', aspectRatio: aspect, ...style }}
     >
-      {topic && topic.trim() !== '' && (
+      {showControls && topic && topic.trim() !== '' && (
         <>
           <button
             type="button"
@@ -264,7 +271,8 @@ export default function ImageGridCell({
           </button>
         </>
       )}
-      <div ref={containerRef} className="w-full h-full relative overflow-hidden rounded-3xl flex items-center justify-center">
+      <div ref={containerRef} style={objectFit === 'contain' ? { containerType: 'size' } : undefined}
+        className="w-full h-full relative overflow-hidden rounded-3xl flex items-center justify-center">
         {(!topic || !isActive) && <div className="text-6xl text-gray-400 font-light">+</div>}
       </div>
     </div>

@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 from cyclo_data.recorder.camera_info_snapshot import CameraInfoSnapshot
+from cyclo_data.recorder.camera_selection import CameraSelection
 from cyclo_data.recorder.rosbag_control import RosbagControl
 from cyclo_data.recorder.session_manager import DataManager
 from cyclo_data.recorder.transcoder import TranscodeWorker
@@ -46,9 +47,7 @@ from orchestrator.internal.device_manager.storage_checker import StorageChecker
 from shared.robot_configs import schema as robot_schema
 
 from interfaces.msg import DataOperationStatus, RecordingStatus
-from interfaces.srv import RecordingCommand
-
-
+from interfaces.srv import RecordingCameras, RecordingCommand
 _COMMAND_NAMES = {
     RecordingCommand.Request.START: 'START',
     RecordingCommand.Request.STOP: 'STOP',
@@ -74,7 +73,6 @@ class RecordingService:
     SERVICE_NAME = '/data/recording'
     STATUS_TOPIC = '/data/recording/status'
     STATUS_PERIOD_SEC = 0.2  # 5 Hz
-
     # Matches orchestrator.OrchestratorNode.DEFAULT_SAVE_ROOT_PATH so the
     # on-disk layout is identical during the C2d-3 → C2d-4 handoff.
     DEFAULT_SAVE_ROOT_PATH = Path.home() / '.cache/huggingface/lerobot'
@@ -100,6 +98,8 @@ class RecordingService:
         self._last_video_stats: dict = {}
         self._last_camera_info_files: dict = {}
         self._last_camera_rotations: dict = {}
+        self._camera_selection = CameraSelection()
+        self._video_camera_selection = None
         # rosbag_recorder's `prepare` always destroys + recreates its
         # subscriptions (service_bag_recorder.cpp:188-192), which resets
         # the topic monitor's EMA baseline and triggers a fresh wave of
@@ -143,11 +143,67 @@ class RecordingService:
             self._callback,
             callback_group=node.state_callback_group,
         )
+        self._camera_server = node.create_service(
+            RecordingCameras, '/data/recording/cameras',
+            self._camera_configuration_callback,
+            callback_group=node.state_callback_group,
+        )
         node.get_logger().info(f'Service advertised: {self.SERVICE_NAME}')
         node.get_logger().info(
             f'Status topic: {self.STATUS_TOPIC} '
             f'({int(1.0 / self.STATUS_PERIOD_SEC)} Hz, '
             'system metrics published continuously)')
+
+    def _camera_configuration_locked(self):
+        with self._session_lock:
+            dm = self._data_manager
+        return self._finish_episode_in_progress() or (
+            dm is not None and (
+                dm.is_recording()
+                or dm.get_current_record_status().record_phase != RecordingStatus.READY
+            )
+        )
+
+    def _camera_configuration_callback(self, request, response):
+        """Read/apply the actual video and camera-info inventory, never inference."""
+        robot_type = request.robot_type
+        try:
+            if not robot_type:
+                raise ValueError('Select a robot before configuring cameras')
+            groups = robot_schema.get_image_topics(
+                robot_schema.load_robot_section(robot_type))
+            response.camera_names = list(groups)
+            response.image_topics = [cfg['topic'] for cfg in groups.values()]
+            response.rotation_degrees = [
+                int(cfg.get('rotation_deg', 0) or 0) for cfg in groups.values()]
+            response.locked = self._camera_configuration_locked()
+            if request.apply:
+                if response.locked:
+                    raise ValueError('Stop recording and wait for saving before changing cameras')
+                if self._robot_type and robot_type != self._robot_type:
+                    raise ValueError('Robot changed; refresh the Record tab before applying')
+                unknown = set(request.enabled_cameras) - set(groups)
+                if unknown:
+                    raise ValueError(f'Unknown cameras: {", ".join(sorted(unknown))}')
+                previous = dict(self._camera_selection.robots)
+                self._camera_selection.robots[robot_type] = [
+                    name for name in groups if name in request.enabled_cameras]
+                try:
+                    self._ensure_video_pipeline(robot_type)
+                    self._camera_selection.save()
+                except Exception:
+                    self._camera_selection.robots = previous
+                    self._video_camera_selection = None
+                    self._ensure_video_pipeline(robot_type)
+                    raise
+            response.enabled_cameras = self._camera_selection.enabled(robot_type, groups)
+            response.success = True
+            response.message = f'{len(response.enabled_cameras)}/{len(groups)} cameras enabled'
+        except Exception as exc:  # noqa: BLE001
+            response.success = False
+            response.message = str(exc)
+            self._node.get_logger().error(f'Recording camera configuration: {exc}')
+        return response
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -502,16 +558,14 @@ class RecordingService:
         """
         if not robot_type:
             return
-        if self._video_robot_type == robot_type and (
-            self._video_recorder is not None or self._camera_info is not None
-        ):
-            return
-
         image_topics, camera_info_topics, rotations = self._resolve_video_topics(
             robot_type)
-        self._last_image_topics = image_topics
-        self._last_camera_info_topics = camera_info_topics
-        self._last_camera_rotations = rotations
+        selection = (image_topics, camera_info_topics, rotations)
+        if (
+            self._video_robot_type == robot_type
+            and self._video_camera_selection == selection
+        ):
+            return
 
         if self._video_recorder is None:
             if image_topics:
@@ -520,11 +574,7 @@ class RecordingService:
                     callback_group=getattr(self._node, 'io_callback_group', None),
                 )
         else:
-            try:
-                self._video_recorder.reconfigure(image_topics)
-            except Exception as exc:  # noqa: BLE001
-                self._node.get_logger().error(
-                    f'VideoRecorder.reconfigure failed: {exc!r}')
+            self._video_recorder.reconfigure(image_topics)
 
         if self._camera_info is None:
             if camera_info_topics:
@@ -533,13 +583,13 @@ class RecordingService:
                     callback_group=getattr(self._node, 'io_callback_group', None),
                 )
         else:
-            try:
-                self._camera_info.reconfigure(camera_info_topics)
-            except Exception as exc:  # noqa: BLE001
-                self._node.get_logger().error(
-                    f'CameraInfoSnapshot.reconfigure failed: {exc!r}')
+            self._camera_info.reconfigure(camera_info_topics)
 
+        self._last_image_topics = image_topics
+        self._last_camera_info_topics = camera_info_topics
+        self._last_camera_rotations = rotations
         self._video_robot_type = robot_type
+        self._video_camera_selection = selection
         self._node.get_logger().info(
             f'Video pipeline ready for robot_type={robot_type!r} '
             f'(cameras={len(image_topics)}, '
@@ -557,13 +607,10 @@ class RecordingService:
         caching — recording is infrequent enough that the IO is
         negligible.
         """
-        try:
-            section = robot_schema.load_robot_section(robot_type)
-        except Exception as exc:
-            self._node.get_logger().error(
-                f'Failed to load robot section for {robot_type!r}: {exc!r}')
-            return {}, {}, {}
+        section = robot_schema.load_robot_section(robot_type)
         image_groups = robot_schema.get_image_topics(section)
+        enabled = self._camera_selection.enabled(robot_type, image_groups)
+        image_groups = {cam: cfg for cam, cfg in image_groups.items() if cam in enabled}
         image_topics = {
             cam: cfg['topic'] for cam, cfg in image_groups.items()
         }
@@ -571,7 +618,10 @@ class RecordingService:
             cam: int(cfg.get('rotation_deg', 0) or 0)
             for cam, cfg in image_groups.items()
         }
-        camera_info_topics = robot_schema.get_camera_info_topics(section)
+        camera_info_topics = {
+            cam: topic for cam, topic in robot_schema.get_camera_info_topics(section).items()
+            if cam in image_topics
+        }
         return image_topics, camera_info_topics, rotations
 
     def _do_start(self, request, response):

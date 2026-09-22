@@ -17,12 +17,30 @@ when only one half needs to come up (debugging).
 """
 
 import os
+import fcntl
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription
+from launch.actions import OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
+
+
+_bringup_lock = None
+
+
+def _guard_single_bringup(context):
+    global _bringup_lock
+    handle = open('/tmp/cyclo_intelligence_bringup.lock', 'a')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError('Cyclo Intelligence is already running. Reuse the existing '
+                           'instance or stop it before launching again.')
+    _bringup_lock = handle  # Retain the lock until this launch process exits.
+    return []
 
 
 def generate_launch_description():
@@ -42,6 +60,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        OpaqueFunction(function=_guard_single_bringup),
         orchestrator_bringup,
         cyclo_data_node,
     ])

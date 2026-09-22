@@ -63,6 +63,7 @@ import {
   buildCameraMonitorTopics,
   isMonitorOnlyStatusMessage,
   shouldAnnounceRecordingStart,
+  shouldShowCameraMonitorAlert,
 } from '../utils/recordingStatusMonitor';
 
 export function useRosTopicSubscription() {
@@ -142,6 +143,15 @@ export function useRosTopicSubscription() {
 
   const notifyCameraMonitorIssues = useCallback(
     (cameraTopics) => {
+      const currentPage = store.getState().ui.currentPage;
+      if (!shouldShowCameraMonitorAlert(currentPage)) {
+        // Do not carry a hidden warning's dedup/cooldown state into Record or
+        // Inference when the operator leaves Mission Canvas.
+        previousCameraMonitorIssueKeyRef.current = '';
+        lastCameraMonitorAlertAtRef.current = 0;
+        return;
+      }
+
       const issueRows = cameraTopics.filter((topic) => topic.status !== 0);
       const issueKey = issueRows
         .map((topic) => `${topic.name}:${topic.status}:${topic.timestampStatus}`)
@@ -555,6 +565,7 @@ export function useRosTopicSubscription() {
     [InferencePhase.LOADING]: 'LOADING',
     [InferencePhase.INFERENCING]: 'INFERENCING',
     [InferencePhase.PAUSED]: 'PAUSED',
+    [InferencePhase.SYNCING]: 'SYNCING',
   }[phase] || 'UNKNOWN'), []);
 
   const subscribeToTrainingStatus = useCallback(async () => {

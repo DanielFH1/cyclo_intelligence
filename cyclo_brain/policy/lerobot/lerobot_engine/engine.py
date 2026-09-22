@@ -110,11 +110,19 @@ class LeRobotEngine(
         # Resolved after load: which cameras / joint groups feed which
         # policy keys. ``_cameras`` maps RobotClient camera name → policy
         # input key (``observation.images.<cam>``). ``_state_modalities``
-        # is the sorted list of follower joint groups whose positions are
-        # concatenated into ``observation.state``.
+        # follows robot_config observation.state order; tactile modalities
+        # are appended only for policies whose state shape expects them.
         self._cameras: Dict[str, str] = {}
         self._state_modalities: List[str] = []
+        self._tactile_modalities: List[str] = []
+        # Policy tactile feature key -> RobotClient sensor name.
+        self._tactile_inputs: Dict[str, str] = {}
+        # Policy tactile feature key -> per-taxel startup median.
+        self._tactile_baselines: Dict[str, np.ndarray] = {}
         self._action_keys: List[str] = []
+        # Optional exact joint order stored by policies whose state contains
+        # only a subset of the robot joints (for example right-only T-Rex).
+        self._observation_state_joint_names: List[str] = []
         self._has_mobile_state: bool = False
         # Cached robot_type for repeated LOAD requests before an explicit
         # UNLOAD. cleanup() must clear this together with the policy cache.
@@ -126,6 +134,8 @@ class LeRobotEngine(
         # expected size. If config doesn't expose a target shape for a
         # camera, we leave that image at native resolution.
         self._image_resize: Dict[str, tuple[int, int]] = {}
+        self._act_overlap_tails: list[torch.Tensor] = []
+        self._act_overlap_last_action: torch.Tensor | None = None
 
     # ------------------------------------------------------------------ #
     # InferenceEngine API
@@ -173,6 +183,7 @@ class LeRobotEngine(
                 self._loaded_model_path = model_path
                 self._apply_policy_optimization(model_path, request)
 
+            self._reset_policy_runtime_state()
             self._init_robot(robot_type)
             self._loaded_robot_type = robot_type
             self._image_resize = self._infer_image_resize(self._policy)
@@ -195,7 +206,9 @@ class LeRobotEngine(
         if not self.is_ready:
             return self._fail("Not in inference mode")
         try:
-            obs = self._build_observation(getattr(request, "task_instruction", ""))
+            obs = self._build_observation(
+                getattr(request, "task_instruction", "")
+            )
             if "success" in obs:
                 return obs
 
@@ -221,6 +234,45 @@ class LeRobotEngine(
             logger.error("get_action_chunk failed: %s", e, exc_info=True)
             return self._fail(str(e))
 
+    def reset_cycle(self) -> Dict[str, Any]:
+        """Reset episode-scoped runtime state without reloading weights.
+
+        A new manipulation cycle must not inherit ACT overlap tails, policy
+        queues, processor state, or tactile zero offsets from the completed
+        cycle. Recreating RobotClient also obtains a fresh synchronized sensor
+        snapshot. Model/pre/postprocessor objects remain resident on the GPU.
+        """
+        if (
+            self._policy is None
+            or self._preprocessor is None
+            or self._postprocessor is None
+            or not self._loaded_robot_type
+        ):
+            return self._fail("No loaded policy to reset")
+
+        robot_type = self._loaded_robot_type
+        try:
+            self._teardown_robot()
+            self._reset_policy_runtime_state()
+            self._init_robot(robot_type)
+            self._image_resize = self._infer_image_resize(self._policy)
+            logger.info(
+                "Started fresh policy cycle with cached weights: %s",
+                self._loaded_model_path,
+            )
+            return {
+                "success": True,
+                "message": "cycle reset (policy cached; tactile baseline recalibrated)",
+                "action_keys": list(self._action_keys),
+            }
+        except Exception as e:
+            logger.error("reset_cycle failed: %s", e, exc_info=True)
+            # A partially reattached RobotClient is not safe to use, but keep
+            # the cached model and robot type so a PAUSED retry can reattach
+            # cleanly without making Main's loaded session state inconsistent.
+            self._teardown_robot()
+            return self._fail(str(e))
+
     def cleanup(self) -> None:
         """Release robot and policy resources for a true UNLOAD."""
         self._teardown_robot()
@@ -239,10 +291,16 @@ class LeRobotEngine(
         self._loaded_model_path = None
         self._loaded_robot_type = None
         self._image_resize = {}
+        self._act_overlap_tails = []
+        self._act_overlap_last_action = None
 
         self._cameras = {}
         self._state_modalities = []
+        self._tactile_modalities = []
+        self._tactile_inputs = {}
+        self._tactile_baselines = {}
         self._action_keys = []
+        self._observation_state_joint_names = []
         self._has_mobile_state = False
 
         if had_policy:
