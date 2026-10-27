@@ -186,6 +186,15 @@ jobs:
             orchestrator/tests/data_processing/test_episode_editor.py \
             orchestrator/tests/data_processing/test_replay_handler.py
 
+      - name: Run LeRobot converter metadata tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+          PYTHONPATH: cyclo_data:orchestrator:shared
+        run: |
+          set -euo pipefail
+          python -m pytest cyclo_data/tests/converter/test_lerobot_feature_names.py
+          python -m pytest orchestrator/tests/data_processing/test_rosbag_to_lerobot_converter.py
+
       - name: Run shared policy runtime tests
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
