@@ -2,6 +2,14 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.1 (2026-10-27)
+------------------
+* Added episode-local int64 ``frame_index`` values and matching feature metadata to LeRobot v2.1 exports.
+* Preserved task instruction strings as the pandas index in LeRobot v3.0 task metadata so dataset readers return the correct instruction.
+* Invalidated legacy v2.1 episode Parquet and v3.0 task metadata caches so reconversion rebuilds the affected files.
+* Kept the LeRobot dataset format versions at ``v2.1`` and ``v3.0``.
+* Contributors: DanielFH1, Taehyeong Kim
+
 1.4.0 (2026-08-31)
 ------------------
 * Removed the BT process and tree-file handlers from the video file server; the supervisor API owns them.

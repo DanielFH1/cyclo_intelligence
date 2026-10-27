@@ -2,6 +2,14 @@
 Changelog for package cyclo_intelligence
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.1 (2026-10-27)
+------------------
+* Fixed LeRobot v2.1 frame indices and v3.0 task instruction metadata in dataset conversion.
+* Added CI regression coverage for exported metadata, episode frame indices, and cache invalidation/reuse.
+* Updated Cyclo release metadata and the default Cyclo image tag to ``robotis/cyclo-intelligence:1.4.1``.
+* Kept the LeRobot and GR00T policy image versions unchanged.
+* Contributors: DanielFH1, Taehyeong Kim
+
 1.4.0 (2026-08-31)
 ------------------
 * Added Autonomy Studio: Mission Canvas and Action Canvas replace the Navigation and BT Manager pages.
