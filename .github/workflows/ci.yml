@@ -77,7 +77,6 @@ jobs:
             --from-paths ros_ws/src \
             --ignore-src \
             --rosdistro jazzy
-          # Keep Arrow compatible with the NumPy 1.x ROS stack.
           python3 -m pip install --no-cache-dir --break-system-packages \
             setuptools==68.1.2 \
             'numpy<2' \
@@ -91,7 +90,8 @@ jobs:
             'pyarrow==24.0.0' \
             pytest \
             pyyaml
-          python3 -c "import numpy, pyarrow; print('NumPy', numpy.__version__, 'PyArrow', pyarrow.__version__)"
+          # Match the NumPy 1.x-compatible PyArrow version in both Cyclo images.
+          python3 -c 'import numpy, pandas, pyarrow; print(numpy.__version__, pandas.__version__, pyarrow.__version__)'
 
       - name: Build ROS packages
         run: |
@@ -147,9 +147,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
           python -m pip install --upgrade pip
-          # Match the Arrow/NumPy combination used by the ROS job.
           python -m pip install \
             'numpy<2' \
+            'opencv-python-headless==4.11.0.86' \
             huggingface_hub \
             matplotlib \
             mcap \
@@ -160,8 +160,9 @@ jobs:
             'pyarrow==24.0.0' \
             pytest \
             pyyaml
-          python -c "import numpy, pyarrow; print('NumPy', numpy.__version__, 'PyArrow', pyarrow.__version__)"
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          # Catch binary compatibility errors before collecting the test suites.
+          python -c 'import cv2, numpy, pandas, pyarrow; print(cv2.__version__, numpy.__version__, pandas.__version__, pyarrow.__version__)'
 
       - name: Run cyclo_data tests
         env:
@@ -174,12 +175,6 @@ jobs:
             cyclo_data/tests/recorder/test_session_archive.py \
             cyclo_data/tests/recorder/test_transcoder.py \
             cyclo_data/tests/recorder/test_video_recorder.py
-
-      - name: Run converter regression tests
-        env:
-          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
-          PYTHONPATH: cyclo_data:orchestrator:shared
-        run: python -m pytest cyclo_data/tests/converter
 
       - name: Run orchestrator tests
         env:
@@ -195,6 +190,15 @@ jobs:
             orchestrator/tests/data_processing/test_video_metadata_extractor.py \
             orchestrator/tests/data_processing/test_episode_editor.py \
             orchestrator/tests/data_processing/test_replay_handler.py
+
+      - name: Run LeRobot converter metadata tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+          PYTHONPATH: cyclo_data:orchestrator:shared
+        run: |
+          set -euo pipefail
+          python -m pytest cyclo_data/tests/converter
+          python -m pytest orchestrator/tests/data_processing/test_rosbag_to_lerobot_converter.py
 
       - name: Run shared policy runtime tests
         env:
