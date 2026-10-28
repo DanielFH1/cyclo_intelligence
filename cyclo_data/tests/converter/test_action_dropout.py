@@ -122,6 +122,75 @@ def test_healthy_synchronous_streams_are_unchanged(tmp_path):
     assert episode.length == 61
 
 
+def test_duplicate_timestamp_uses_last_command_without_duplicate_frames(tmp_path):
+    converter = make_converter(tmp_path)
+    topics = {
+        "/left": [(0.0, np.array([1])), (0.0, np.array([2]))],
+        "/right": [(0.0, np.array([10])), (1.0, np.array([11]))],
+    }
+    actions = merge(converter, topics)
+    assert [timestamp for timestamp, _ in actions] == [0.0, 1.0]
+    np.testing.assert_array_equal(actions[0][1], [2, 10])
+    np.testing.assert_array_equal(actions[1][1], [2, 11])
+
+
+def test_invalid_joint_mapping_does_not_emit_partial_action(tmp_path):
+    converter = make_converter(tmp_path)
+    converter._joint_order_by_group = {"leader_hand_left": ["missing_joint"]}
+    assert merge(converter, {"/left": stream(), "/right": stream()}) == []
+
+
+def test_resampling_starts_when_all_topics_first_have_commands(tmp_path):
+    converter = make_converter(tmp_path)
+    converter.config.fps = 10
+    actions = merge(converter, {
+        "/left": [(0.0, np.array([1])), (0.1, np.array([2])), (0.2, np.array([3]))],
+        "/right": [(0.03, np.array([10])), (0.13, np.array([20]))],
+    })
+    state = [(0.0, np.array([100])), (0.1, np.array([200])), (0.2, np.array([300]))]
+    episode, _ = converter._resample_to_fps(EpisodeData(0), state, actions, 0.0)
+    assert episode.grid_log_times_sec == pytest.approx([0.03, 0.13])
+    np.testing.assert_array_equal(episode.observation_state, [[100], [200]])
+    np.testing.assert_array_equal(episode.action, [[1, 10], [2, 20]])
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_mixed_rate_groups_match_independent_causal_lookup(tmp_path, seed):
+    converter = make_converter(tmp_path)
+    rng = np.random.default_rng(seed)
+    layouts = [("arm", 7), ("hand", 20), ("head", 2), ("mobile", 3)]
+    converter._action_topic_key_map = {
+        f"/{name}": f"leader_{name}" for name, _ in layouts
+    }
+    topics, names = {}, {}
+    for name, width in reversed(layouts):
+        times = np.unique(rng.integers(0, 2000, size=120)) / 1000
+        if name == "hand":
+            times = times[(times < 0.5) | (times > 1.5)]
+        elif name == "mobile":
+            times = times[times < 0.5]
+        topics[f"/{name}"] = [
+            (float(t), rng.normal(size=width).astype(np.float32)) for t in times
+        ]
+        names[f"/{name}"] = [f"{name}_{i}" for i in range(width)]
+
+    actions = converter._merge_action_messages(topics, names)
+    first_valid = max(messages[0][0] for messages in topics.values())
+    expected_times = sorted({
+        t for messages in topics.values() for t, _ in messages if t >= first_valid
+    })
+    assert [t for t, _ in actions] == expected_times
+    for timestamp, actual in actions:
+        expected = np.concatenate([
+            [value for t, value in topics[f"/{name}"] if t <= timestamp][-1]
+            for name, _ in layouts
+        ])
+        np.testing.assert_array_equal(actual, expected)
+    assert converter._action_joint_names == [
+        joint for name, _ in layouts for joint in names[f"/{name}"]
+    ]
+
+
 @pytest.mark.parametrize("kind", ["extract", "prepared"])
 def test_old_cache_is_rejected_and_current_cache_is_readable(tmp_path, kind):
     converter = make_converter(tmp_path)
