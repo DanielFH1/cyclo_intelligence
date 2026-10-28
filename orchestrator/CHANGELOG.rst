@@ -2,6 +2,12 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.1 (2026-10-27)
+------------------
+* Updated converter regression tests to validate LeRobot v2.1 frame indices, real pandas task metadata, and legacy cache replacement.
+* Updated Cyclo release metadata to 1.4.1.
+* Contributors: Taehyeong Kim
+
 1.4.0 (2026-08-31)
 ------------------
 * Added the ArmStateGate node, per-joint JointControl selection, and SendCommand inference lifecycle control.
