@@ -1431,7 +1431,10 @@ class TestEpisodeExtractCache(unittest.TestCase):
             )
 
             first = converter._episode_extract_cache_path(bag, None, [])
+            before = mcap.stat()
             mcap.write_bytes(b"two")
+            # Equal-sized writes can share an mtime on coarse-resolution filesystems.
+            os.utime(mcap, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
             second = converter._episode_extract_cache_path(bag, None, [])
 
             self.assertIsNotNone(first)

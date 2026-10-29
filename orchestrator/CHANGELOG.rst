@@ -2,6 +2,12 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.2 (2026-10-28)
+------------------
+* Made the converter cache invalidation regression test deterministic on filesystems with coarse timestamp resolution.
+* Updated Cyclo release metadata to 1.4.2.
+* Contributors: DanielFH1, Taehyeong Kim
+
 1.4.1 (2026-10-27)
 ------------------
 * Updated converter regression tests to validate LeRobot v2.1 frame indices, real pandas task metadata, and legacy cache replacement.
