@@ -2,11 +2,19 @@
 Changelog for package cyclo_intelligence
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-1.4.2 (2026-10-29)
+1.4.3 (2026-10-29)
 ------------------
 * Fixed ARM64 LeRobot CUDA initialization failing with error 801 when the inherited compatibility driver shadows the host driver after a JetPack update.
-* Updated Cyclo release metadata and default image tags to ``robotis/cyclo-intelligence:1.4.2`` and ``robotis/lerobot-zenoh:1.4.2``.
+* Updated Cyclo release metadata and default image tags to ``robotis/cyclo-intelligence:1.4.3`` and ``robotis/lerobot-zenoh:1.4.2``.
 * Contributors: Taehyeong Kim
+
+1.4.2 (2026-10-28)
+------------------
+* Fixed LeRobot conversion so a stopped action topic no longer freezes other command groups.
+* Extended converter CI coverage and invalidated affected caches; existing exported datasets require reconversion to receive corrected actions.
+* Updated Cyclo release metadata and the default Cyclo image tag to ``robotis/cyclo-intelligence:1.4.2``.
+* Kept LeRobot dataset format versions and LeRobot/GR00T policy image versions unchanged.
+* Contributors: DanielFH1, Taehyeong Kim
 
 1.4.1 (2026-10-27)
 ------------------

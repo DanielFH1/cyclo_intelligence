@@ -197,7 +197,7 @@ jobs:
           PYTHONPATH: cyclo_data:orchestrator:shared
         run: |
           set -euo pipefail
-          python -m pytest cyclo_data/tests/converter/test_lerobot_feature_names.py
+          python -m pytest cyclo_data/tests/converter
           python -m pytest orchestrator/tests/data_processing/test_rosbag_to_lerobot_converter.py
 
       - name: Run shared policy runtime tests

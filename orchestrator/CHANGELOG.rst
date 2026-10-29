@@ -2,9 +2,15 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-1.4.2 (2026-10-29)
+1.4.3 (2026-10-29)
 ------------------
 * None
+
+1.4.2 (2026-10-28)
+------------------
+* Made the converter cache invalidation regression test deterministic on filesystems with coarse timestamp resolution.
+* Updated Cyclo release metadata to 1.4.2.
+* Contributors: DanielFH1, Taehyeong Kim
 
 1.4.1 (2026-10-27)
 ------------------
