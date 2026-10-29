@@ -2,6 +2,10 @@
 Changelog for package orchestrator
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.2 (2026-10-29)
+------------------
+* None
+
 1.4.1 (2026-10-27)
 ------------------
 * Updated converter regression tests to validate LeRobot v2.1 frame indices, real pandas task metadata, and legacy cache replacement.

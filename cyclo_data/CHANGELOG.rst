@@ -2,6 +2,10 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.2 (2026-10-29)
+------------------
+* None
+
 1.4.1 (2026-10-27)
 ------------------
 * Added episode-local int64 ``frame_index`` values and matching feature metadata to LeRobot v2.1 exports.
