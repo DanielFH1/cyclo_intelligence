@@ -2,6 +2,10 @@
 Changelog for package cyclo_data
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.4.3 (2026-10-29)
+------------------
+* None
+
 1.4.2 (2026-10-28)
 ------------------
 * Fixed merged actions freezing when one recorded command topic stops publishing; each topic now holds its latest command independently.
