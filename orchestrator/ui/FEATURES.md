@@ -91,10 +91,13 @@ Dataset editing page.
 
 ### Robot controls
 
-The app-wide **Robot controls** bar shows the control source and the last
-reported joystick mode after a robot is selected. Expand it to switch the source;
-hand preset controls are collapsed separately. Unsupported services leave their
-controls disabled. Opening the panel never sends a robot command.
+The **Robot** toggle sits above **Rosbag Recorder**, inside the existing sidebar
+header space. It opens a compact floating panel without resizing the recording
+layout. Click the Source status to switch External (blue) / Teleop (green).
+Joystick status shows Head (purple) / Base (amber); change it with the leader.
+Choose left and/or right presets and press Apply. Only edited hands are sent,
+so there is no separate target selector. Click outside or press Escape to close.
+Opening the panel and editing fields never send a robot command.
 
 | Function | Existing AI Worker interface | Behavior |
 |---------|-----------------------------|----------|

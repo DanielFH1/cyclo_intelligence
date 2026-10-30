@@ -26,6 +26,7 @@ import InlineSystemStatus from '../components/InlineSystemStatus';
 import ImageGrid from '../components/ImageGrid';
 import RobotViewer3D from '../components/RobotViewer3D';
 import SegmentPanel from '../components/SegmentPanel';
+import RobotControlPanel from '../features/robotControl/RobotControlPanel';
 import RecordTopicMonitor from '../components/RecordTopicMonitor';
 import { setIsFirstLoadFalse } from '../features/ui/uiSlice';
 import { useRosServiceCaller } from '../hooks/useRosServiceCaller';
@@ -224,7 +225,9 @@ export default function RecordPage({ isActive = true }) {
             </span>
           </button>
           <div className={classRightPanel}>
-            <div className="w-full min-h-10"></div>
+            <div className="w-full min-h-10 flex items-center justify-end pr-6">
+              {!isRightPanelCollapsed && <RobotControlPanel />}
+            </div>
             <SegmentPanel />
           </div>
         </div>

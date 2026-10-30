@@ -157,11 +157,11 @@ export default function useRobotControl(robotType, modeTopic = DEFAULT_MODE_TOPI
 
   const run = async (kind, action) => {
     const ctx = session.current;
-    if (!ctx?.alive || !ctx.ros.isConnected || ctx.busy) return;
+    if (!ctx?.alive || !ctx.ros.isConnected || ctx.busy) return false;
     ctx.busy = true;
     ctx.patch({ pending: kind, notice: '', error: '' });
-    try { await action(ctx); }
-    catch (error) { if (ctx.alive) ctx.patch({ error: error.message }); }
+    try { await action(ctx); return ctx.alive; }
+    catch (error) { if (ctx.alive) ctx.patch({ error: error.message }); return false; }
     finally {
       ctx.busy = false;
       if (ctx.alive) ctx.patch({ pending: null });
