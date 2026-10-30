@@ -6,7 +6,7 @@ import { useSelector } from 'react-redux';
 import ROSLIB from 'roslib';
 import rosConnectionManager from '../../utils/rosConnectionManager';
 import {
-  DEFAULT_MODE_TOPIC, PRESET_SERVICE, PRESET_TYPE, SOURCE_SERVICE,
+  PRESET_SERVICE, PRESET_TYPE, SOURCE_SERVICE,
   SOURCE_STALE_MS, SOURCE_TOPIC, SOURCE_TYPE, normalizeSource, presetRequest,
 } from './controlProtocol';
 
@@ -56,7 +56,7 @@ function callService(ros, name, serviceType, args, timeout = 4000) {
   });
 }
 
-export default function useRobotControl(robotType, modeTopic = DEFAULT_MODE_TOPIC) {
+export default function useRobotControl(robotType, modeTopic) {
   const url = useSelector((state) => state.ros.rosbridgeUrl);
   const [state, setState] = useState(emptyState);
   const session = useRef(null);
@@ -83,25 +83,63 @@ export default function useRobotControl(robotType, modeTopic = DEFAULT_MODE_TOPI
       ctx.discovering = true;
       ctx.discoveryAt = Date.now();
       try {
-        const [source, presets, mode] = await Promise.all([
+        const [source, presets] = await Promise.all([
           callService(ctx.ros, '/rosapi/services_for_type', 'rosapi_msgs/srv/ServicesForType', { type: SOURCE_TYPE }),
           callService(ctx.ros, '/rosapi/services_for_type', 'rosapi_msgs/srv/ServicesForType', { type: PRESET_TYPE }),
-          modeTopic ? callService(ctx.ros, '/rosapi/publishers', 'rosapi_msgs/srv/Publishers', { topic: modeTopic }) : Promise.resolve({ publishers: [] }),
         ]);
         if (!ctx.alive) return;
         ctx.canSetSource = source.services?.includes(SOURCE_SERVICE) === true;
         ctx.canSetPreset = presets.services?.includes(PRESET_SERVICE) === true;
         patch(ctx, {
           canSetSource: ctx.canSetSource, canSetPreset: ctx.canSetPreset,
-          modeAvailable: Array.isArray(mode.publishers) && mode.publishers.length > 0,
-          ...(!mode.publishers?.length ? { mode: null } : {}),
           ...(!ctx.canSetPreset ? { selected: { left: null, right: null } } : {}),
         });
       } catch (_) {
         ctx.canSetSource = false;
         ctx.canSetPreset = false;
-        patch(ctx, { canSetSource: false, canSetPreset: false, mode: null, modeAvailable: null, selected: { left: null, right: null } });
+        patch(ctx, { canSetSource: false, canSetPreset: false, selected: { left: null, right: null } });
       } finally { ctx.discovering = false; }
+    };
+    const changeModeTopic = (ctx, topicName) => {
+      if (ctx.modeTopic === topicName) return;
+      if (ctx.modeSubscription) {
+        ctx.modeSubscription.unsubscribe();
+        ctx.subscriptions = ctx.subscriptions.filter((topic) => topic !== ctx.modeSubscription);
+      }
+      ctx.modeTopic = topicName;
+      ctx.modeSubscription = null;
+      patch(ctx, { mode: null, modeAvailable: topicName ? null : false });
+      if (topicName) ctx.modeSubscription = ctx.subscribe(topicName, (message) => {
+        if (ctx.modeTopic !== topicName) return;
+        patch(ctx, { mode: typeof message.data === 'string' ? message.data : null, modeAvailable: true });
+      });
+    };
+    const discoverMode = async (ctx) => {
+      if (ctx.modeDiscovering) return;
+      ctx.modeDiscovering = true;
+      ctx.modeDiscoveryAt = Date.now();
+      try {
+        // Use the same robot configuration as the Record tab; never guess a
+        // leader-specific topic or the initial mode. An explicit override is
+        // useful for deployments embedding the panel with their own schema.
+        const info = modeTopic === undefined
+          ? await callService(ctx.ros, '/get_robot_info', 'interfaces/srv/GetRobotInfo', {})
+          : { success: true, joystick_mode_topic: modeTopic };
+        if (!ctx.alive) return;
+        const configuredTopic = info.success === true && (!info.robot_type || info.robot_type === robotType)
+          && typeof info.joystick_mode_topic === 'string' ? info.joystick_mode_topic.trim() : '';
+        changeModeTopic(ctx, configuredTopic);
+        if (!configuredTopic) return;
+        const result = await callService(ctx.ros, '/rosapi/publishers', 'rosapi_msgs/srv/Publishers', { topic: configuredTopic });
+        if (!ctx.alive) return;
+        const available = Boolean(result.publishers?.length);
+        patch(ctx, { modeAvailable: available, ...(!available ? { mode: null } : {}) });
+      } catch (_) {
+        if (ctx.alive) {
+          changeModeTopic(ctx, '');
+          patch(ctx, { mode: null, modeAvailable: null });
+        }
+      } finally { ctx.modeDiscovering = false; }
     };
     const tick = () => {
       const ros = robotType && url ? rosConnectionManager.getCurrentConnection() : null;
@@ -114,6 +152,7 @@ export default function useRobotControl(robotType, modeTopic = DEFAULT_MODE_TOPI
         const ctx = {
           ros, alive: true, subscriptions: [], source: null, sourceAt: 0, sourceSequence: 0,
           busy: false, canSetSource: false, canSetPreset: false, discoveryAt: 0,
+          modeTopic: null, modeSubscription: null, modeDiscoveryAt: 0,
         };
         current = ctx;
         session.current = ctx;
@@ -132,15 +171,14 @@ export default function useRobotControl(robotType, modeTopic = DEFAULT_MODE_TOPI
           topic.callForSubscribeAndAdvertise = ros.callOnConnection.bind(ros);
           topic.subscribe((message) => { if (ctx.alive) callback(message); });
           ctx.subscriptions.push(topic);
+          return topic;
         };
+        ctx.subscribe = subscribe;
         subscribe(SOURCE_TOPIC, (message) => {
           ctx.source = normalizeSource(message.data);
           ctx.sourceAt = Date.now();
           ctx.sourceSequence += 1;
           patch(ctx, { source: ctx.source });
-        });
-        if (modeTopic) subscribe(modeTopic, (message) => {
-          patch(ctx, { mode: typeof message.data === 'string' ? message.data : null, modeAvailable: true });
         });
       }
       const ctx = current;
@@ -149,6 +187,7 @@ export default function useRobotControl(robotType, modeTopic = DEFAULT_MODE_TOPI
         patch(ctx, { source: null, mode: null });
       }
       if (!ctx.discoveryAt || Date.now() - ctx.discoveryAt >= 5000) discover(ctx);
+      if (!ctx.modeDiscoveryAt || Date.now() - ctx.modeDiscoveryAt >= 5000) discoverMode(ctx);
     };
     tick();
     const timer = setInterval(tick, 500);

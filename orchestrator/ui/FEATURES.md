@@ -103,7 +103,7 @@ Opening the panel and editing fields never send a robot command.
 |---------|-----------------------------|----------|
 | Source status | `/source`, `std_msgs/msg/String` | `teleop` → Teleop; `model_action` or `external` → External. Missing/unknown or more than 3 seconds without a heartbeat → Unknown. |
 | Source selection | `/set_source`, `std_srvs/srv/SetBool` | `true` requests Teleop; `false` requests External. Completion requires a new matching source report, not just an accepted response. Does not enable arms. |
-| Joystick mode | `/leader/joystick_controller_right/joystick_mode`, `std_msgs/msg/String` | `head_control` → Head; `swerve` → Base; legacy `arm_control` → Arm. Display only; there is no mode-switch service in the supported leader. |
+| Joystick mode | `/get_robot_info` → `joystick_mode_topic`, `std_msgs/msg/String` (SH5: `/reference/joystick/mode`) | `head_control` → Head; `swerve` → Base; legacy `arm_control` → Arm. Display only; there is no mode-switch service in the supported leader. |
 | Hand preset selection | `/hand_preset_controller/set_preset`, `robotis_interfaces/srv/SetPreset` | Select left/right/both hands and IDs, then Apply. Defaults offer 1 (Envelope), 2 (Pinch), 3 (Three-finger); custom IDs 1–65535 are supported. The robot validates configured IDs. |
 
 `orchestrator_bringup.launch.py` also starts `rosapi` so the UI can discover
@@ -113,10 +113,13 @@ must contain the matching `robotis_interfaces/srv/SetPreset` definition to call
 the optional preset service. No AI Worker code changes are required.
 
 **Status limits:** the leader publishes joystick mode only on change. It starts
-as Waiting for mode in the UI; switch it with a short simultaneous leader-button press
-to obtain a report. The UI labels a received value “last reported” because a
-leader mode publisher availability is checked every 5 seconds. When it disappears,
-the UI clears the previous mode and displays Leader unavailable.
+as Waiting in the popup; switch it with a short simultaneous leader-button press
+to obtain a report. The popup checks the configured topic and its publisher every 5 seconds.
+An empty configuration is not replaced by a guessed topic. When it disappears,
+the popup clears the previous mode and displays Offline.
+Refreshing the browser cannot recover an event published before it subscribed;
+no initial mode is inferred and no mode command is sent. Runtime deployments must
+install the updated SH5 YAML and reload the orchestrator robot configuration.
 Hand preset selection has no current-state/completion topic: the UI shows only
 the last selection accepted in this browser connection, not the physical hand
 state. `/control/status` preset IDs refer to a different controller and are not

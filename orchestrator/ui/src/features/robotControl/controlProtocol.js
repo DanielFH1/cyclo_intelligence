@@ -6,7 +6,6 @@ export const SOURCE_SERVICE = '/set_source';
 export const PRESET_SERVICE = '/hand_preset_controller/set_preset';
 export const SOURCE_TYPE = 'std_srvs/srv/SetBool';
 export const PRESET_TYPE = 'robotis_interfaces/srv/SetPreset';
-export const DEFAULT_MODE_TOPIC = '/leader/joystick_controller_right/joystick_mode';
 export const SOURCE_STALE_MS = 3000;
 
 export function normalizeSource(value) {

@@ -3,7 +3,10 @@ import { useSelector } from 'react-redux';
 import ROSLIB from 'roslib';
 import rosConnectionManager from '../../utils/rosConnectionManager';
 import useRobotControl from './useRobotControl';
-import { DEFAULT_MODE_TOPIC } from './controlProtocol';
+const DEFAULT_MODE_TOPIC = '/reference/joystick/mode';
+const fixtureResponse = (message) => message.service === '/get_robot_info'
+  ? { success: true, joystick_mode_topic: DEFAULT_MODE_TOPIC }
+  : { services: [], publishers: ['/leader/joystick_controller'] };
 
 jest.mock('react-redux', () => ({ useSelector: jest.fn() }));
 jest.mock('../../utils/rosConnectionManager', () => ({
@@ -18,7 +21,7 @@ test('real roslib sends both subscriptions and receives mode/source reports with
     const message = JSON.parse(data);
     sent.push(message);
     if (message.op === 'call_service') {
-      ros.emit(message.id, { result: true, values: { services: [] } });
+      ros.emit(message.id, { result: true, values: fixtureResponse(message) });
     }
   } };
   useSelector.mockImplementation((selector) => selector({ ros: { rosbridgeUrl: 'ws://fixture' } }));
@@ -77,7 +80,7 @@ test('mode changes update Head/Base state without issuing robot commands', async
   ros.socket = { send: (data) => {
     const message = JSON.parse(data);
     sent.push(message);
-    if (message.op === 'call_service') ros.emit(message.id, { result: true, values: { services: [] } });
+    if (message.op === 'call_service') ros.emit(message.id, { result: true, values: fixtureResponse(message) });
   } };
   useSelector.mockImplementation((selector) => selector({ ros: { rosbridgeUrl: 'ws://fixture' } }));
   rosConnectionManager.getCurrentConnection.mockReturnValue(ros);
@@ -89,7 +92,7 @@ test('mode changes update Head/Base state without issuing robot commands', async
       expect(result.current.mode).toBe(mode);
     }
     expect(sent.filter((message) => message.op === 'call_service')
-      .every((message) => ['/rosapi/services_for_type', '/rosapi/publishers'].includes(message.service))).toBe(true);
+      .every((message) => ['/get_robot_info', '/rosapi/services_for_type', '/rosapi/publishers'].includes(message.service))).toBe(true);
     act(() => { ros.isConnected = false; ros.emit('close'); });
     expect(result.current.mode).toBeNull();
     expect(ros.listeners(DEFAULT_MODE_TOPIC)).toHaveLength(0);

@@ -2,8 +2,11 @@ import { act, renderHook } from '@testing-library/react';
 import { useSelector } from 'react-redux';
 import useRobotControl from './useRobotControl';
 import rosConnectionManager from '../../utils/rosConnectionManager';
-import { DEFAULT_MODE_TOPIC, PRESET_SERVICE, SOURCE_SERVICE } from './controlProtocol';
+import { PRESET_SERVICE, SOURCE_SERVICE } from './controlProtocol';
 
+const DEFAULT_MODE_TOPIC = '/reference/joystick/mode';
+let mockModeTopic;
+let mockInfoFailure;
 const mockTopics = [];
 const mockCalls = [];
 let mockAvailable = true;
@@ -34,6 +37,8 @@ beforeEach(() => {
   mockCalls.length = 0;
   mockAvailable = true;
   mockLeaderAvailable = true;
+  mockModeTopic = DEFAULT_MODE_TOPIC;
+  mockInfoFailure = false;
   const listeners = new Map();
   ros = {
     isConnected: true, idCounter: 0,
@@ -45,6 +50,10 @@ beforeEach(() => {
       const success = (values) => listeners.get(message.id)?.({ result: true, values });
       const failure = (values) => listeners.get(message.id)?.({ result: false, values });
       mockCalls.push({ name: message.service, serviceType: message.type, args: message.args, success, failure });
+      if (message.service === '/get_robot_info') {
+        if (mockInfoFailure) failure({ message: 'Unavailable' });
+        else success({ success: true, joystick_mode_topic: mockModeTopic });
+      }
       if (message.service === '/rosapi/publishers') success({ publishers: mockLeaderAvailable ? ['/leader/joystick_controller'] : [] });
       if (message.service === '/rosapi/services_for_type') {
         success({ services: mockAvailable ? ['/set_source', '/hand_preset_controller/set_preset'] : [] });
@@ -214,4 +223,51 @@ test('clears the last joystick mode when the leader publisher disappears', async
   expect(result.current.mode).toBeNull();
   emit(DEFAULT_MODE_TOPIC, 'head_control');
   expect(result.current.mode).toBe('head_control');
+});
+
+
+test('uses the configured topic and retires its subscription when configuration changes', async () => {
+  mockModeTopic = '/custom/leader/mode';
+  const { result, unmount } = renderHook(() => useRobotControl('robot'));
+  await flush();
+  expect(command('/rosapi/publishers').args).toEqual({ topic: mockModeTopic });
+  expect(mockTopics.some((t) => t.name === DEFAULT_MODE_TOPIC)).toBe(false);
+  emit(mockModeTopic, 'swerve');
+  const previous = mockTopics.at(-1);
+  mockModeTopic = DEFAULT_MODE_TOPIC;
+  await advance(5000);
+  await flush();
+  expect(previous.unsubscribe).toHaveBeenCalledTimes(1);
+  expect(result.current.mode).toBeNull();
+  act(() => previous.callback({ data: 'swerve' }));
+  expect(result.current.mode).toBeNull();
+  emit(DEFAULT_MODE_TOPIC, 'head_control');
+  expect(result.current.mode).toBe('head_control');
+  unmount();
+  expect(mockTopics.every((t) => t.unsubscribe.mock.calls.length === 1)).toBe(true);
+});
+
+test('an empty configured mode topic is not replaced with a hard-coded fallback', async () => {
+  mockModeTopic = '';
+  const { result } = renderHook(() => useRobotControl('robot'));
+  await flush();
+  expect(mockTopics.map((t) => t.name)).toEqual(['/source']);
+  expect(command('/rosapi/publishers')).toBeUndefined();
+  expect(result.current.mode).toBeNull();
+  expect(result.current.modeAvailable).toBe(false);
+  expect(result.current.canSetSource).toBe(true);
+});
+
+test('robot info lookup failure does not disable source or preset services and is retried', async () => {
+  mockInfoFailure = true;
+  const { result } = renderHook(() => useRobotControl('robot'));
+  await flush();
+  expect(result.current.canSetSource).toBe(true);
+  expect(result.current.canSetPreset).toBe(true);
+  expect(result.current.mode).toBeNull();
+  mockInfoFailure = false;
+  await advance(5000);
+  await flush();
+  emit(DEFAULT_MODE_TOPIC, 'swerve');
+  expect(result.current.mode).toBe('swerve');
 });

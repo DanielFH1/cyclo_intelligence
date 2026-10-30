@@ -6,7 +6,7 @@ import { createPortal } from 'react-dom';
 import { useSelector } from 'react-redux';
 import { MdTune } from 'react-icons/md';
 import useRobotControl from './useRobotControl';
-import { DEFAULT_MODE_TOPIC, modeLabel } from './controlProtocol';
+import { modeLabel } from './controlProtocol';
 import './RobotControlPanel.css';
 
 export default function RobotControlPanel() {
@@ -14,7 +14,7 @@ export default function RobotControlPanel() {
   return robotType ? <RobotControls key={robotType} robotType={robotType} /> : null;
 }
 
-export function RobotControls({ robotType, modeTopic = DEFAULT_MODE_TOPIC }) {
+export function RobotControls({ robotType, modeTopic }) {
   const control = useRobotControl(robotType, modeTopic);
   const [expanded, setExpanded] = useState(false);
   const [left, setLeft] = useState('');
