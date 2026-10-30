@@ -1,0 +1,39 @@
+.robot-control {
+  flex-shrink: 0;
+  border-bottom: 1px solid #dbe3ed;
+  background: #f8fafc;
+  color: #1e293b;
+  font-size: 13px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.robot-control-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 16px; }
+.robot-control-toggle { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; padding: 4px; }
+.robot-control-badge { border: 1px solid #cbd5e1; border-radius: 6px; padding: 3px 8px; }
+.robot-control-badge.is-teleop { background: #dcfce7; color: #166534; border-color: #86efac; }
+.robot-control-badge.is-external { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+.robot-control-muted { color: #64748b; }
+.robot-control-details { display: flex; flex-wrap: wrap; gap: 16px 24px; padding: 8px 20px 16px; }
+.robot-control-section { flex: 1 1 300px; }
+.robot-control h2 { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.robot-control p { margin-top: 8px; line-height: 1.5; }
+.robot-control-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.robot-control-actions button, .robot-control select, .robot-control input {
+  border: 1px solid #94a3b8; border-radius: 6px; padding: 6px 10px; background: #fff; color: inherit;
+}
+.robot-control-actions button[aria-pressed="true"] { border-color: #0284c7; background: #e0f2fe; color: #075985; }
+.robot-control button:disabled, .robot-control select:disabled, .robot-control input:disabled { opacity: .5; cursor: not-allowed; }
+.robot-control button:focus-visible, .robot-control select:focus-visible, .robot-control input:focus-visible, .robot-control summary:focus-visible { outline: 2px solid #0284c7; outline-offset: 2px; }
+.robot-control label { display: flex; flex-direction: column; gap: 4px; }
+.robot-control-presets { flex-basis: 100%; border-top: 1px solid #dbe3ed; padding-top: 10px; }
+.robot-control-presets summary { cursor: pointer; font-weight: 600; }
+.robot-control-preset-body form { margin-top: 12px; }
+.robot-control input { width: 130px; }
+.robot-control-feedback { padding: 0 20px 10px; }
+.robot-control-error { color: #b91c1c; }
+.dark .robot-control { background: #0f172a; color: #e2e8f0; border-color: #334155; }
+.dark .robot-control-muted { color: #94a3b8; }
+.dark .robot-control-actions button, .dark .robot-control select, .dark .robot-control input { background: #1e293b; }
+.dark .robot-control-actions button[aria-pressed="true"] { background: #0c4a6e; color: #e0f2fe; }
+.dark .robot-control-presets, .dark .robot-control-badge { border-color: #475569; }
+.dark .robot-control-error { color: #fca5a5; }

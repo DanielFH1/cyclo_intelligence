@@ -89,6 +89,50 @@ Dataset editing page.
 
 ## Components
 
+### Robot controls
+
+The app-wide **Robot controls** bar shows the control source and the last
+reported joystick mode after a robot is selected. Expand it to switch the source;
+hand preset controls are collapsed separately. Unsupported services leave their
+controls disabled. Opening the panel never sends a robot command.
+
+| Function | Existing AI Worker interface | Behavior |
+|---------|-----------------------------|----------|
+| Source status | `/source`, `std_msgs/msg/String` | `teleop` → Teleop; `model_action` or `external` → External. Missing/unknown or more than 3 seconds without a heartbeat → Unknown. |
+| Source selection | `/set_source`, `std_srvs/srv/SetBool` | `true` requests Teleop; `false` requests External. Completion requires a new matching source report, not just an accepted response. Does not enable arms. |
+| Joystick mode | `/leader/joystick_controller_right/joystick_mode`, `std_msgs/msg/String` | `head_control` → Head; `swerve` → Base; legacy `arm_control` → Arm. Display only; there is no mode-switch service in the supported leader. |
+| Hand preset selection | `/hand_preset_controller/set_preset`, `robotis_interfaces/srv/SetPreset` | Select left/right/both hands and IDs, then Apply. Defaults offer 1 (Envelope), 2 (Pinch), 3 (Three-finger); custom IDs 1–65535 are supported. The robot validates configured IDs. |
+
+`orchestrator_bringup.launch.py` also starts `rosapi` so the UI can discover
+services by type without probing a motion service. Custom bringups must launch
+`rosapi/rosapi_node` as `rosapi` alongside rosbridge. The rosbridge environment
+must contain the matching `robotis_interfaces/srv/SetPreset` definition to call
+the optional preset service. No AI Worker code changes are required.
+
+**Status limits:** the leader publishes joystick mode only on change. It starts
+as Waiting for mode in the UI; switch it with a short simultaneous leader-button press
+to obtain a report. The UI labels a received value “last reported” because a
+leader mode publisher availability is checked every 5 seconds. When it disappears,
+the UI clears the previous mode and displays Leader unavailable.
+Hand preset selection has no current-state/completion topic: the UI shows only
+the last selection accepted in this browser connection, not the physical hand
+state. `/control/status` preset IDs refer to a different controller and are not
+used as hand-preset feedback. External changes are not inferred. Source handoffs
+can clear arm activation; the user enables the desired arms with the leader.
+
+All status and accepted selections reset when the ROS connection or selected
+robot changes. Requests have timeouts, cannot overlap, are never automatically
+retried, and are not sent while disconnected. Check the robot after an uncertain
+timeout before retrying.
+
+Validation: run `CI=true npm test -- --watchAll=false --runInBand
+--testPathPattern=robotControl` and `npm run build` in `orchestrator/ui`.
+For a connected UI check, verify source changes from the leader, a Head/Base
+report after a short simultaneous press, Leader unavailable after stopping the
+leader, and cleared status after disconnecting. With
+the robot in a safe test configuration, verify explicit source selection and
+hand preset requests; unsupported robots must keep these controls unavailable.
+
 ### Image & Camera
 | Component | File | Description |
 |-----------|------|-------------|

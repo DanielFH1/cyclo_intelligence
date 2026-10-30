@@ -23,6 +23,7 @@ import { Toaster } from 'react-hot-toast';
 import toast from 'react-hot-toast';
 import './App.css';
 import ThemeToggle from './components/ThemeToggle';
+import RobotControlPanel from './features/robotControl/RobotControlPanel';
 import HomePage from './pages/HomePage';
 import RecordPage from './pages/RecordPage';
 import InferencePage from './pages/InferencePage';
@@ -511,7 +512,9 @@ function App() {
         </div>
         </aside>
       )}
-      <main className="flex-1 flex flex-col h-screen bg-white dark:bg-slate-950">
+      <main className="flex-1 min-w-0 flex flex-col h-screen bg-white dark:bg-slate-950">
+        <RobotControlPanel />
+        <div className="relative flex-1 min-h-0 flex flex-col">
         {page === PageType.HOME ? (
           <HomePage />
         ) : page === PageType.RECORD ? (
@@ -532,6 +535,7 @@ function App() {
         ) : (
           <HomePage />
         )}
+        </div>
       </main>
       <Toaster
         position="top-center"
